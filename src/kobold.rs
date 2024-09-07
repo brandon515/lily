@@ -1,12 +1,12 @@
-use std::{sync::Arc, vec};
+use std::vec;
 
-/*use std::io::{self, Write};
+use std::io::{self, Write};
 use reqwest::header;
 use reqwest_eventsource::{
     EventSource,
-    Event,
+    Event as KoboldEvent,
 };
-use futures_util::StreamExt;*/
+use futures_util::StreamExt;
 use serde::{
     Serialize,
     Deserialize,
@@ -174,8 +174,22 @@ async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, UnboundedRece
         let mut prompts = Vec::new();
         while let Some(msg) = input_rx.recv().await{
             prompts.push(
-                format!("{HEADER_START}user{HEADER_END}{}: {}", msg.message)
+                format!("{HEADER_START}user{HEADER_END}{}: {}{TEXT_END}", msg.author, msg.message)
             );
+            if msg.send{
+                let mut headers = header::HeaderMap::new();
+                headers.insert("accept", header::HeaderValue::from_static("application/json"));
+                headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
+                let client = match reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build(){
+                        Ok(r) => r,
+                        Err(err) =>{
+                            println!("Reqwest client can't be built: {}", err);
+                            continue;
+                        }
+                    };
+            }
         }
     });
     (input_tx, output_rx)
