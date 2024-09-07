@@ -119,9 +119,9 @@ impl Reciever{
 impl VoiceEventHandler for Reciever{
   async fn act(&self, ctx: &EventContext<'_>) -> Option<songbird::Event>{
     match ctx{
-      EventContext::ClientDisconnect(_con_data)=> {
+      EventContext::DriverConnect(_con_data)=> {
         println!("Connected");
-      }
+      },
       EventContext::SpeakingStateUpdate(Speaking{
         speaking,
         ssrc,
