@@ -11,9 +11,9 @@ use serde::{
   Deserialize,
 };
 use tokio::sync::mpsc::{
-  unbounded_channel as tokio_channel,
-  UnboundedSender, 
-  UnboundedReceiver
+  unbounded_channel as tokio_channel, 
+  UnboundedReceiver, 
+  UnboundedSender
 };
 
 #[derive(Serialize)]
@@ -152,9 +152,10 @@ impl KoboldData{
 #[derive(Deserialize)]
 struct KoboldResponse{
   token: String,
-  finish_reason: String,
+  _finish_reason: String,
 }
 
+#[derive(Debug)]
 pub struct KoboldMessage{
   pub send: bool,
   pub message: String,
@@ -173,6 +174,7 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
   tokio::spawn(async move{
     let mut prompts = Vec::new();
     while let Some(msg) = input_rx.recv().await{
+      //println!("msg recieved: {:?}", msg);
       prompts.push(
         format!("{HEADER_START}user{HEADER_END}\n\n{}: {}{TEXT_END}", msg.author, msg.message)
       );
@@ -180,6 +182,7 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
         let mut headers = header::HeaderMap::new();
         headers.insert("accept", header::HeaderValue::from_static("application/json"));
         headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
+        prompts.push(format!("{HEADER_START}assistant{HEADER_END}"));
         let combined_prompts = prompts.join("");
         let new_prompt = format!(
           "{TEXT_START}{HEADER_START}system{HEADER_END}\n\n{AI_DESC}{TEXT_END}"
@@ -209,73 +212,35 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
           println!("Error sending the channel from kobold: {}", err);
           continue;
         }
-        tokio::spawn(async move {
-          while let Some(event) = es.next().await{
-            match event{
-              Ok(KoboldEvent::Open) => println!("Kobold connection opened"),
-              Ok(KoboldEvent::Message(ev)) => {
-                match serde_json::from_str::<KoboldResponse>(&ev.data){
-                  Ok(r) => {
-                    if let Err(_) = kobold_tx.send(r.token){
-                      break;
-                    }
-                  },
-                  Err(err) => {
-                    println!("Malformed response from KoboldCPP: {}", err);
+        let mut final_generation = String::new();
+        while let Some(event) = es.next().await{
+          match event{
+            Ok(KoboldEvent::Open) => println!("Kobold connection opened"),
+            Ok(KoboldEvent::Message(ev)) => {
+              match serde_json::from_str::<KoboldResponse>(&ev.data){
+                Ok(r) => {
+                  final_generation.push_str(&r.token);
+                  if let Err(_) = kobold_tx.send(r.token){
                     break;
                   }
-                };
-              },
-              Err(err) =>{
+                },
+                Err(err) => {
+                  println!("Malformed response from KoboldCPP: {}", err);
+                  break;
+                }
+              };
+            },
+            Err(err) =>{
+              if err.to_string() != "Stream ended"{
                 println!("Error in connection to KoboldCPP: {}", err);
-                break;
               }
+              break;
             }
           }
-        });
+        }
+        prompts.push(format!("{final_generation}{TEXT_END}"));
       }
     }
   });
   (input_tx, output_rx)
 }
-
-/*#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>>{
-    let mut headers = header::HeaderMap::new();
-    headers.insert("accept", header::HeaderValue::from_static("application/json"));
-    headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
-    let client = reqwest::Client::builder()
-        .default_headers(headers)
-        .build()?;
-    let prompt = "Niko the kobold stalked carefully down the alley, his small scaly figure obscured by a dusky cloak that fluttered lightly in the cold winter breeze.".to_string();
-    let breakers = vec!["\\n".to_string()];
-    let data = KoboldData::new(prompt, breakers);
-    let req = client.post("http://localhost:5001/api/extra/generate/stream")
-        .json(&data);
-    let mut es = EventSource::new(req)?;
-    while let Some(event) = es.next().await{
-        match event {
-            Ok(Event::Open) => println!("Connection Established."),
-            Ok(Event::Message(ev)) => {
-                let resp: KoboldResponse = serde_json::from_str(&ev.data)?;
-                if resp.finish_reason == "null"{
-                    print!("{}", resp.token);
-                    io::stdout().flush()?;
-                }
-            },
-            Err(err) => {
-                match err{
-                    reqwest_eventsource::Error::StreamEnded => {
-                        es.close();
-                    },
-                    _ => {
-                        println!("{err:#?}");
-                        es.close();
-                    }
-                };
-            }
-        }
-        
-    }
-    Ok(())
-}*/

@@ -7,7 +7,7 @@ use poise::serenity_prelude as serenity;
 use serde::Deserialize;
 use ::serenity::{
   all::{
-    ChannelId as PoiseChannelId, CreateMessage, EditMessage, Http, Mentionable, Message
+    ChannelId as PoiseChannelId, EditMessage, Http, Mentionable
   }, 
   async_trait
 };
@@ -26,7 +26,7 @@ use tokio_tungstenite::{
   tungstenite::Message as TungsteniteMessage,
 };
 use std::{
-  collections::HashMap, fmt::Debug, fs::File, io::Read, sync::{
+  fmt::Debug, fs::File, io::Read, sync::{
       atomic::{
       AtomicBool, 
       Ordering,
@@ -49,6 +49,7 @@ type DiscordSink = futures_util::stream::SplitSink<
     tokio_tungstenite::MaybeTlsStream<
       tokio::net::TcpStream>>, TungsteniteMessage>;
 
+#[derive(Debug)]
 struct TranscriptionMessage{
   id: VoiceId,
   text: String,
@@ -79,46 +80,37 @@ struct InnerReceiver{
 impl Reciever{
   pub fn new(channel: PoiseChannelId) -> Self{
     let(trans_tx,mut rx) = tokio::sync::mpsc::unbounded_channel::<TranscriptionMessage>();
+    let thread_chan = channel.clone();
     tokio::spawn(async move{
       let (kobold_tx, mut kobold_rx) = kobold::spawn_kobold_thread().await;
-      let token = std::env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
-      let http = Http::new(&token);
-      let mut message_log = HashMap::<VoiceId, Message>::new();
       while let Some(msg) = rx.recv().await{
-        if msg.text == ""{
-          if let Some(full_msg) = message_log.remove(&msg.id){
-            if let Err(err) = kobold_tx.send(kobold::KoboldMessage{
-              send: full_msg.clone().content.to_lowercase().contains("hey lily"),
-              author: full_msg.id.get(),
-              message: full_msg.content,
-            }){
-              println!("Kobold thread has run into an error: {err}");
-              continue;
-            }
-            if let Some(rec) = kobold_rx.recv().await{
-              tokio::spawn(async move{
-                //
-              });
-            }
-          }
+        //println!("Receiver main thread: {msg:?}");
+        let activation_phrase_present = true;//msg.text.to_lowercase().contains("hey lily");
+        if let Err(err) = kobold_tx.send(kobold::KoboldMessage{
+          send: activation_phrase_present,
+          author: msg.id.0,
+          message: msg.text,
+        }){
+          println!("Kobold thread has run into an error: {err}");
           continue;
         }
-        if let Some(discord_msg) = message_log.get_mut(&msg.id){
-          if let Err(err) = discord_msg.edit(&http, EditMessage::new().content(
-            format!("<@{}>: {}", msg.id.to_string(), msg.text)
-          )).await{
-            println!("Unable to edit message with ID {}: {}", discord_msg.id, err);
-          }
-        }else{
-          match channel.send_message(&http, CreateMessage::new().content(
-            format!("<@{}>: {}", msg.id.to_string(), msg.text)
-          )).await{
-            Ok(r) => {
-              message_log.insert(msg.id, r);
-            },
-            Err(err) => {
-              println!("Error sending message: {}", err);
-            }
+        if activation_phrase_present{
+          if let Some(mut kobold_response_rx) = kobold_rx.recv().await{
+            let local_chan = thread_chan.clone();
+            tokio::spawn(async move{
+              let token = std::env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
+              let http = Http::new(&token);
+              let mut discord_message = local_chan.say(&http, "...")
+                .await
+                .expect("Unable to send a message in discord");
+              let mut final_string = String::new();
+              while let Some(text_to_send) = kobold_response_rx.recv().await{
+                final_string = final_string + &text_to_send;
+              }
+              discord_message.edit(&http, EditMessage::new()
+                .content(final_string)
+              ).await.expect("Unable to edit discord message");
+            });
           }
         }
       }
@@ -187,20 +179,15 @@ impl VoiceEventHandler for Reciever{
                 let discord_tx = self.inner.trans_tx.clone();
                 let id = speaker.id.clone();
                 tokio::spawn(async move{
-                  let purge_msg = TranscriptionMessage{
-                    id,
-                    text: "".to_string(),
-                  };
-                  let new_rx = discord_tx.clone();
-                  let mut write = spawn_discord_thread(new_rx, id).await;
+                  let mut write = spawn_discord_thread(discord_tx, id).await;
                   while let Some(data) = rx.recv().await{
                     let bytes = resample_discord_to_bytes(data);
                     if let Err(_) = write.feed(TungsteniteMessage::binary(bytes)).await{
-                      discord_tx.send(purge_msg).unwrap();
+                      //discord_tx.send(purge_msg).unwrap();
                       return;
                     }
                     if let Err(_) = write.flush().await{
-                      discord_tx.send(purge_msg).unwrap();
+                      //discord_tx.send(purge_msg).unwrap();
                       return;
                     }
                   }
@@ -215,20 +202,22 @@ impl VoiceEventHandler for Reciever{
               },
             };
             if let Err(err) = tx.send(decoded_voice.clone()){
-              println!("Err sending voice data over channel: {}", err);
+              if err.to_string() != "channel closed"{
+                println!("Err sending voice data over channel: {}", err);
+              }
               speaker.message_send = None;
             };
           }else{
             println!("Decode disabled");
           }
         }
-        for ssrc in &tick.silent{
+        /*for ssrc in &tick.silent{
           if let Some(mut speaker) = self.inner.known_ssrcs.get_mut(&ssrc){
             if let Some(_) = &speaker.message_send{
               speaker.message_send = None;
             }
           }
-        }
+        }*/
       },
       _ => unimplemented!(),
     }
@@ -359,14 +348,12 @@ fn resample_discord_to_bytes(sound_data: Vec<i16>) -> Vec<u8>{
   sound_bytes
 }
 
-async fn spawn_discord_thread(discord_rx: UnboundedSender<TranscriptionMessage>, id: VoiceId) -> DiscordSink{
+async fn spawn_discord_thread(discord_tx: UnboundedSender<TranscriptionMessage>, id: VoiceId) -> DiscordSink{
   let(ws_stream, _) = connect_async(
     "ws://localhost:8000/v1/audio/transcriptions?language=en"
   ).await.expect("Failed to connect to whisper server");
   let (write, mut read) = ws_stream.split();
-  let new_rx = discord_rx.clone();
   tokio::spawn(async move{
-    let local_tx = &new_rx.clone();
     let mut full_transcription = String::new();
     while let Some(mes_res) = read.next().await{
       let mes = match mes_res{
@@ -385,14 +372,17 @@ async fn spawn_discord_thread(discord_rx: UnboundedSender<TranscriptionMessage>,
       };
       let json_mes: WhisperResponse = match serde_json::from_str(&json_text){
         Ok(r) => r,
-        Err(err) => {
-          println!("Not able to put string from whisper server into a json object: {}", err);
+        Err(_) => {
+          //println!("Not able to put string from whisper server into a json object: {}", err);
           break;
         }
       };
       full_transcription = json_mes.text;
     }
-    if let Err(err) = local_tx.send(TranscriptionMessage{
+    if full_transcription == String::new(){
+      return;
+    }
+    if let Err(err) = discord_tx.send(TranscriptionMessage{
       id,
       text: full_transcription,
     }){
