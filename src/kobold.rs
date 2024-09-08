@@ -165,6 +165,7 @@ const TEXT_START: &str = "<|begin_of_text|>";
 const TEXT_END: &str = "<|eot_id|>";
 const HEADER_START: &str = "<|start_header_id|>";
 const HEADER_END: &str = "<|end_header_id|>";
+const AI_DESC: &str = "You are a discord bot on a server called Big Gay Rock. You are speaking to the members of the server and will help them with whatever they ask.";
 
 pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, UnboundedReceiver<UnboundedReceiver<String>>){
   let (input_tx, mut input_rx) = tokio_channel::<KoboldMessage>();
@@ -181,7 +182,7 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
         headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
         let combined_prompts = prompts.join("");
         let new_prompt = format!(
-          "{TEXT_START}{HEADER_START}system{HEADER_END}\n\nBlah{TEXT_END}"
+          "{TEXT_START}{HEADER_START}system{HEADER_END}\n\n{AI_DESC}{TEXT_END}"
         );
         let prompt = new_prompt + &combined_prompts;
         let data = KoboldData::new(prompt);
