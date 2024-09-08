@@ -155,10 +155,10 @@ struct KoboldResponse{
   finish_reason: String,
 }
 
-struct KoboldMessage{
-  send: bool,
-  message: String,
-  author: u32,
+pub struct KoboldMessage{
+  pub send: bool,
+  pub message: String,
+  pub author: u64,
 }
 
 const TEXT_START: &str = "<|begin_of_text|>";
@@ -166,7 +166,7 @@ const TEXT_END: &str = "<|eot_id|>";
 const HEADER_START: &str = "<|start_header_id|>";
 const HEADER_END: &str = "<|end_header_id|>";
 
-async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, UnboundedReceiver<UnboundedReceiver<String>>){
+pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, UnboundedReceiver<UnboundedReceiver<String>>){
   let (input_tx, mut input_rx) = tokio_channel::<KoboldMessage>();
   let (output_tx, output_rx) = tokio_channel();
   tokio::spawn(async move{
