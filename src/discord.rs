@@ -35,6 +35,8 @@ use std::{
   }
 };
 
+use crate::kobold;
+
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 type CommandResult = Result<(), Error>;
@@ -78,12 +80,27 @@ impl Reciever{
   pub fn new(channel: PoiseChannelId) -> Self{
     let(trans_tx,mut rx) = tokio::sync::mpsc::unbounded_channel::<TranscriptionMessage>();
     tokio::spawn(async move{
+      let (kobold_tx, mut kobold_rx) = kobold::spawn_kobold_thread().await;
       let token = std::env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
       let http = Http::new(&token);
       let mut message_log = HashMap::<VoiceId, Message>::new();
       while let Some(msg) = rx.recv().await{
         if msg.text == ""{
-          message_log.remove(&msg.id);
+          if let Some(full_msg) = message_log.remove(&msg.id){
+            if let Err(err) = kobold_tx.send(kobold::KoboldMessage{
+              send: full_msg.clone().content.to_lowercase().contains("hey lily"),
+              author: full_msg.id.get(),
+              message: full_msg.content,
+            }){
+              println!("Kobold thread has run into an error: {err}");
+              continue;
+            }
+            if let Some(rec) = kobold_rx.recv().await{
+              tokio::spawn(async move{
+                //
+              });
+            }
+          }
           continue;
         }
         if let Some(discord_msg) = message_log.get_mut(&msg.id){
@@ -346,20 +363,41 @@ async fn spawn_discord_thread(discord_rx: UnboundedSender<TranscriptionMessage>,
   let(ws_stream, _) = connect_async(
     "ws://localhost:8000/v1/audio/transcriptions?language=en"
   ).await.expect("Failed to connect to whisper server");
-  let (write, read) = ws_stream.split();
+  let (write, mut read) = ws_stream.split();
   let new_rx = discord_rx.clone();
   tokio::spawn(async move{
     let local_tx = &new_rx.clone();
-    read.for_each(|mes| async{
-      if let Ok(r) =  serde_json::from_str::<WhisperResponse>(&mes.unwrap().into_text().unwrap()){
-          if let Err(err) = local_tx.send(TranscriptionMessage{
-            id,
-            text: r.text,
-          }){
-            println!("Error sending trascription message: {}", err);
-          };
-      }
-    }).await;
+    let mut full_transcription = String::new();
+    while let Some(mes_res) = read.next().await{
+      let mes = match mes_res{
+        Ok(r) => r,
+        Err(err) => {
+          println!("Error getting data from whisper server: {}", err);
+          break;
+        }
+      };
+      let json_text = match mes.into_text(){
+        Ok(r) => r,
+        Err(err) => {
+          println!("Data received from whisper server could not be made into utf-8 string: {}", err);
+          break;
+        }
+      };
+      let json_mes: WhisperResponse = match serde_json::from_str(&json_text){
+        Ok(r) => r,
+        Err(err) => {
+          println!("Not able to put string from whisper server into a json object: {}", err);
+          break;
+        }
+      };
+      full_transcription = json_mes.text;
+    }
+    if let Err(err) = local_tx.send(TranscriptionMessage{
+      id,
+      text: full_transcription,
+    }){
+      println!("Error sending trascription message: {}", err);
+    };
   });
   write
 }
