@@ -85,7 +85,7 @@ impl Reciever{
       let (kobold_tx, mut kobold_rx) = kobold::spawn_kobold_thread().await;
       while let Some(msg) = rx.recv().await{
         //println!("Receiver main thread: {msg:?}");
-        let activation_phrase_present = true;//msg.text.to_lowercase().contains("hey lily");
+        let activation_phrase_present = msg.text.to_lowercase().contains("lily");
         if let Err(err) = kobold_tx.send(kobold::KoboldMessage{
           send: activation_phrase_present,
           author: msg.id.0,
