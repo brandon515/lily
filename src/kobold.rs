@@ -176,7 +176,7 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
     while let Some(msg) = input_rx.recv().await{
       //println!("msg recieved: {:?}", msg);
       prompts.push(
-        format!("{HEADER_START}user{HEADER_END}\n\n{}: {}{TEXT_END}", msg.author, msg.message)
+        format!("{HEADER_START}user{HEADER_END}\n\n<@{}>: {}{TEXT_END}", msg.author, msg.message)
       );
       if msg.send{
         let mut headers = header::HeaderMap::new();
@@ -226,7 +226,7 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
                 },
                 Err(err) => {
                   println!("Malformed response from KoboldCPP: {}", err);
-                  break;
+                  continue;
                 }
               };
             },
