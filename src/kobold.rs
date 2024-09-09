@@ -152,7 +152,7 @@ impl KoboldData{
 #[derive(Deserialize)]
 struct KoboldResponse{
   token: String,
-  _finish_reason: String,
+  finish_reason: String,
 }
 
 #[derive(Debug)]
@@ -220,12 +220,13 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
               match serde_json::from_str::<KoboldResponse>(&ev.data){
                 Ok(r) => {
                   final_generation.push_str(&r.token);
-                  if let Err(_) = kobold_tx.send(r.token){
+                  if r.finish_reason == "stop"{
                     break;
                   }
                 },
                 Err(err) => {
                   println!("Malformed response from KoboldCPP: {}", err);
+                  println!("\tresponse: {:?}", ev.data);
                   continue;
                 }
               };
@@ -239,6 +240,9 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
           }
         }
         prompts.push(format!("{final_generation}{TEXT_END}"));
+        if let Err(err) = kobold_tx.send(final_generation){
+          println!("Error sending kobold generation through channel: {}", err);
+        }
       }
     }
   });
