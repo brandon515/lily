@@ -7,7 +7,7 @@ use poise::serenity_prelude as serenity;
 use serde::Deserialize;
 use ::serenity::{
   all::{
-    ChannelId as PoiseChannelId, EditMessage, Http, Mentionable
+    ChannelId as PoiseChannelId, GuildId, Http, Mentionable
   }, 
   async_trait
 };
@@ -20,7 +20,10 @@ use songbird::{
   EventHandler as VoiceEventHandler, 
   Songbird
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{
+  mpsc::UnboundedSender,
+  Mutex as TokioMutex,
+};
 use tokio_tungstenite::{
   connect_async,
   tungstenite::Message as TungsteniteMessage,
@@ -35,7 +38,7 @@ use std::{
   }
 };
 
-use crate::kobold;
+use crate::kobold::{self, KoboldMessage};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
@@ -48,12 +51,6 @@ type DiscordSink = futures_util::stream::SplitSink<
   tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<
       tokio::net::TcpStream>>, TungsteniteMessage>;
-
-#[derive(Debug)]
-struct TranscriptionMessage{
-  id: VoiceId,
-  text: String,
-}
 
 #[derive(Deserialize)]
 struct WhisperResponse{
@@ -74,50 +71,28 @@ struct Speaker {
 struct InnerReceiver{
   last_tick_was_empty: AtomicBool,
   known_ssrcs: dashmap::DashMap<u32, Speaker>,
-  trans_tx: UnboundedSender<TranscriptionMessage>,
+  kobold_tx: UnboundedSender<KoboldMessage>,
 }
 
 impl Reciever{
   pub fn new(channel: PoiseChannelId) -> Self{
-    let(trans_tx,mut rx) = tokio::sync::mpsc::unbounded_channel::<TranscriptionMessage>();
+    let (discord_tx, mut discord_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let thread_chan = channel.clone();
+    let kobold_tx = kobold::spawn_kobold_thread(discord_tx.clone());
     tokio::spawn(async move{
-      let (kobold_tx, mut kobold_rx) = kobold::spawn_kobold_thread().await;
-      while let Some(msg) = rx.recv().await{
-        //println!("Receiver main thread: {msg:?}");
-        let activation_phrase_present = msg.text.to_lowercase().contains("lily");
-        if let Err(err) = kobold_tx.send(kobold::KoboldMessage{
-          send: activation_phrase_present,
-          author: msg.id.0,
-          message: msg.text,
-        }){
-          println!("Kobold thread has run into an error: {err}");
-          continue;
-        }
-        if activation_phrase_present{
-          if let Some(mut kobold_response_rx) = kobold_rx.recv().await{
-            let local_chan = thread_chan.clone();
-            tokio::spawn(async move{
-              let token = std::env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
-              let http = Http::new(&token);
-              let mut discord_message = local_chan.say(&http, "...")
-                .await
-                .expect("Unable to send a message in discord");
-              if let Some(generation) = kobold_response_rx.recv().await{
-                println!("{generation}");
-                discord_message.edit(&http, EditMessage::new()
-                  .content(generation)
-                ).await.expect("Unable to edit discord message");
-              }
-            });
-          }
+      let local_chan = thread_chan.clone();
+      let token = std::env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
+      let http = Http::new(&token);
+      while let Some(generation) = discord_rx.recv().await{
+        if let Err(err) = local_chan.say(&http, generation).await{
+          println!("Error sending message in discord: {}", err);
         }
       }
     });
     Self { inner: Arc::new(InnerReceiver{
         last_tick_was_empty: AtomicBool::new(true),
         known_ssrcs: DashMap::new(),
-        trans_tx,
+        kobold_tx,
       }),
     }
   }
@@ -174,7 +149,7 @@ impl VoiceEventHandler for Reciever{
             let tx = match &speaker.message_send{
               Some(r) => r,
               None => {
-                speaker.message_send = Some(spawn_speaker_thread(self.inner.trans_tx.clone(), speaker.id.clone()).await);
+                speaker.message_send = Some(spawn_speaker_thread(self.inner.kobold_tx.clone(), speaker.id.clone()).await);
                 if let Some(r) = &speaker.message_send{
                   r
                 }else{
@@ -187,7 +162,7 @@ impl VoiceEventHandler for Reciever{
               if err.to_string() != "channel closed"{
                 println!("Err sending voice data over channel: {}", err);
               }
-              let new_tx = spawn_speaker_thread(self.inner.trans_tx.clone(), speaker.id.clone()).await;
+              let new_tx = spawn_speaker_thread(self.inner.kobold_tx.clone(), speaker.id.clone()).await;
               if let Err(err) = tx.send(decoded_voice.clone()){
                 println!("Error creating new channel for voice data: {}", err);
                 speaker.message_send = None;
@@ -208,6 +183,7 @@ impl VoiceEventHandler for Reciever{
 
 pub struct Data {
   songbird: Arc<Songbird>,
+  kobold_channels: DashMap<GuildId, Option<UnboundedSender<KoboldMessage>>>,
 }
 
 #[poise::command(slash_command, prefix_command)]
@@ -242,7 +218,7 @@ async fn mere(ctx: Context<'_>) -> CommandResult{
 
   let manager = ctx.data().songbird.clone();
 
-  if let Ok(handler_lock) = manager.join(guild_id, connect_to).await{
+  if let Ok(handler_lock) = manager.join(guild_id.clone(), connect_to).await{
     let mut handler = handler_lock.lock().await;
 
     let evt_receiver = Reciever::new(ctx.channel_id());
@@ -252,9 +228,33 @@ async fn mere(ctx: Context<'_>) -> CommandResult{
     handler.add_global_event(CoreEvent::VoiceTick.into(), evt_receiver.clone());
     //handler.add_global_event(CoreEvent::RtpPacket.into(), evt_receiver.clone());
 
+    //if let Some(kobold_guild) = ctx.data().kobold_channels.get_mut(&guild_id);
+
     check_msg(ctx.reply(format!("Joined {}", connect_to.mention())).await);
   }
 
+  Ok(())
+}
+
+async fn poise_event_handler(
+  ctx: &serenity::Context,
+  event: &serenity::FullEvent,
+  framework: poise::FrameworkContext<'_, Data, Error>,
+  data: &Data,
+) -> Result<(), Error>{
+  match event {
+    serenity::FullEvent::Ready { data_about_bot } => {
+      data_about_bot.guilds.iter().for_each(|x|{
+        if x.unavailable == false{
+          framework.user_data.kobold_channels.insert(x.id, None);
+        }
+      });
+    },
+    serenity::FullEvent::Message{new_message} =>{
+      framework.user_data;
+    },
+    _ => {}
+  }
   Ok(())
 }
 
@@ -287,6 +287,7 @@ pub fn get_framework(songbird: Arc<Songbird>) -> poise::Framework<Data, Error>{
             poise::builtins::register_globally(ctx, &framework.options().commands).await?;
             Ok(Data {
               songbird,
+              kobold_channels: DashMap::new(),
             })
         })
     })
@@ -329,7 +330,7 @@ fn resample_discord_to_bytes(sound_data: Vec<i16>) -> Vec<u8>{
   sound_bytes
 }
 
-async fn spawn_speaker_thread(discord_tx: UnboundedSender<TranscriptionMessage>, id: VoiceId) -> UnboundedSender<Vec<i16>>{
+async fn spawn_speaker_thread(discord_tx: UnboundedSender<KoboldMessage>, id: VoiceId) -> UnboundedSender<Vec<i16>>{
   let(tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
   tokio::spawn(async move{
     let local_tx = discord_tx.clone();
@@ -353,7 +354,7 @@ async fn spawn_speaker_thread(discord_tx: UnboundedSender<TranscriptionMessage>,
   tx
 }
 
-async fn spawn_whisper_thread(discord_tx: UnboundedSender<TranscriptionMessage>, id: VoiceId) -> DiscordSink{
+async fn spawn_whisper_thread(kobold_tx: UnboundedSender<KoboldMessage>, id: VoiceId) -> DiscordSink{
   let(ws_stream, _) = connect_async(
     "ws://localhost:8000/v1/audio/transcriptions?language=en"
   ).await.expect("Failed to connect to whisper server");
@@ -389,9 +390,9 @@ async fn spawn_whisper_thread(discord_tx: UnboundedSender<TranscriptionMessage>,
     if full_transcription == String::new(){
       return;
     }
-    if let Err(err) = discord_tx.send(TranscriptionMessage{
-      id,
-      text: full_transcription,
+    if let Err(err) = kobold_tx.send(KoboldMessage{
+      author: id.0,
+      message: full_transcription,
     }){
       println!("Error sending trascription message: {}", err);
     };

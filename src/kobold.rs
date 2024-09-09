@@ -11,8 +11,7 @@ use serde::{
   Deserialize,
 };
 use tokio::sync::mpsc::{
-  unbounded_channel as tokio_channel, 
-  UnboundedReceiver, 
+  unbounded_channel as tokio_channel,
   UnboundedSender
 };
 
@@ -157,7 +156,6 @@ struct KoboldResponse{
 
 #[derive(Debug)]
 pub struct KoboldMessage{
-  pub send: bool,
   pub message: String,
   pub author: u64,
 }
@@ -167,10 +165,11 @@ const TEXT_END: &str = "<|eot_id|>";
 const HEADER_START: &str = "<|start_header_id|>";
 const HEADER_END: &str = "<|end_header_id|>";
 const AI_DESC: &str = "You are a discord bot on a server called Big Gay Rock. You are speaking to the members of the server and will help them with whatever they ask.";
+const ACTIVATION_PHRASE: &str = "lily";
+const KOBOLD_URL: &str = "http://localhost:5001/api/extra/generate/stream";
 
-pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, UnboundedReceiver<UnboundedReceiver<String>>){
+pub fn spawn_kobold_thread(output_tx: UnboundedSender<String>) -> UnboundedSender<KoboldMessage>{
   let (input_tx, mut input_rx) = tokio_channel::<KoboldMessage>();
-  let (output_tx, output_rx) = tokio_channel();
   tokio::spawn(async move{
     let mut prompts = Vec::new();
     while let Some(msg) = input_rx.recv().await{
@@ -178,11 +177,11 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
       prompts.push(
         format!("{HEADER_START}user{HEADER_END}\n\n<@{}>: {}{TEXT_END}", msg.author, msg.message)
       );
-      if msg.send{
+      if msg.message.contains(ACTIVATION_PHRASE){
         let mut headers = header::HeaderMap::new();
         headers.insert("accept", header::HeaderValue::from_static("application/json"));
         headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
-        prompts.push(format!("{HEADER_START}assistant{HEADER_END}"));
+        prompts.push(format!("{HEADER_START}assistant{HEADER_END}\n\n"));
         let combined_prompts = prompts.join("");
         let new_prompt = format!(
           "{TEXT_START}{HEADER_START}system{HEADER_END}\n\n{AI_DESC}{TEXT_END}"
@@ -198,7 +197,7 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
               continue;
             }
           };
-        let req = client.post("http://localhost:5001/api/extra/generate/stream")
+        let req = client.post(KOBOLD_URL)
             .json(&data);
         let mut es = match EventSource::new(req){
           Ok(r) => r,
@@ -207,11 +206,6 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
             continue;
           }
         };
-        let (kobold_tx, kobold_rx) = tokio_channel();
-        if let Err(err) = output_tx.send(kobold_rx){
-          println!("Error sending the channel from kobold: {}", err);
-          continue;
-        }
         let mut final_generation = String::new();
         while let Some(event) = es.next().await{
           match event{
@@ -240,11 +234,11 @@ pub async fn spawn_kobold_thread() -> (UnboundedSender<KoboldMessage>, Unbounded
           }
         }
         prompts.push(format!("{final_generation}{TEXT_END}"));
-        if let Err(err) = kobold_tx.send(final_generation){
+        if let Err(err) = output_tx.send(final_generation){
           println!("Error sending kobold generation through channel: {}", err);
         }
       }
     }
   });
-  (input_tx, output_rx)
+  input_tx
 }
