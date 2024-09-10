@@ -1,10 +1,5 @@
 use dashmap::DashMap;
-use futures_util::{
-  SinkExt, 
-  StreamExt
-};
 use poise::serenity_prelude as serenity;
-use serde::Deserialize;
 use ::serenity::{
   all::{
     ChannelId as PoiseChannelId, GuildId, Http, Mentionable
@@ -20,17 +15,13 @@ use songbird::{
   EventHandler as VoiceEventHandler, 
   Songbird
 };
-use tokio::sync::{
-  mpsc::UnboundedSender,
-  Mutex as TokioMutex,
-};
-use tokio_tungstenite::{
-  connect_async,
-  tungstenite::Message as TungsteniteMessage,
-};
+use tokio::sync::mpsc::UnboundedSender;
+use futures_util::SinkExt;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use std::{
-  fmt::Debug, fs::File, io::Read, sync::{
-      atomic::{
+  fmt::Debug,
+  sync::{
+    atomic::{
       AtomicBool, 
       Ordering,
     }, 
@@ -38,7 +29,13 @@ use std::{
   }
 };
 
-use crate::kobold::{self, KoboldMessage};
+use crate::{
+  whisper::spawn_whisper_thread,
+  kobold::{
+    self, 
+    KoboldMessage
+  }
+};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
@@ -47,19 +44,14 @@ type CommandResult = Result<(), Error>;
   tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<
       tokio::net::TcpStream>>>;*/
-type DiscordSink = futures_util::stream::SplitSink<
-  tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<
-      tokio::net::TcpStream>>, TungsteniteMessage>;
 
-#[derive(Deserialize)]
-struct WhisperResponse{
-  text: String,
-}
+
+
 
 #[derive(Clone)]
 pub struct Reciever{
   inner: Arc<InnerReceiver>,
+  default_channel: PoiseChannelId,
 }
 
 #[derive(Clone, Debug)]
@@ -74,26 +66,20 @@ struct InnerReceiver{
   kobold_tx: UnboundedSender<KoboldMessage>,
 }
 
+pub async fn send_discord_message(message: String, channel: PoiseChannelId){
+  let token = std::env::var("DISCORD_TOKEN").expect("Expected DISCORD_URL in the environment variables");
+  let http = Http::new(&token);
+  check_msg(channel.say(&http, message).await);
+}
+
 impl Reciever{
-  pub fn new(channel: PoiseChannelId) -> Self{
-    let (discord_tx, mut discord_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let thread_chan = channel.clone();
-    let kobold_tx = kobold::spawn_kobold_thread(discord_tx.clone());
-    tokio::spawn(async move{
-      let local_chan = thread_chan.clone();
-      let token = std::env::var("DISCORD_TOKEN").expect("Expected DISCORD_URL in the environment variables");
-      let http = Http::new(&token);
-      while let Some(generation) = discord_rx.recv().await{
-        if let Err(err) = local_chan.say(&http, generation).await{
-          println!("Error sending message in discord: {}", err);
-        }
-      }
-    });
+  pub fn new(kobold_tx: UnboundedSender<KoboldMessage>, channel: PoiseChannelId) -> Self{
     Self { inner: Arc::new(InnerReceiver{
         last_tick_was_empty: AtomicBool::new(true),
         known_ssrcs: DashMap::new(),
         kobold_tx,
       }),
+      default_channel: channel,
     }
   }
 }
@@ -149,7 +135,7 @@ impl VoiceEventHandler for Reciever{
             let tx = match &speaker.message_send{
               Some(r) => r,
               None => {
-                speaker.message_send = Some(spawn_speaker_thread(self.inner.kobold_tx.clone(), speaker.id.clone()).await);
+                speaker.message_send = Some(spawn_speaker_thread(self.inner.kobold_tx.clone(), speaker.id.clone(), self.default_channel).await);
                 if let Some(r) = &speaker.message_send{
                   r
                 }else{
@@ -162,7 +148,7 @@ impl VoiceEventHandler for Reciever{
               if err.to_string() != "channel closed"{
                 println!("Err sending voice data over channel: {}", err);
               }
-              let new_tx = spawn_speaker_thread(self.inner.kobold_tx.clone(), speaker.id.clone()).await;
+              let new_tx = spawn_speaker_thread(self.inner.kobold_tx.clone(), speaker.id.clone(), self.default_channel).await;
               if let Err(err) = tx.send(decoded_voice.clone()){
                 println!("Error creating new channel for voice data: {}", err);
                 speaker.message_send = None;
@@ -183,7 +169,7 @@ impl VoiceEventHandler for Reciever{
 
 pub struct Data {
   songbird: Arc<Songbird>,
-  kobold_channels: DashMap<GuildId, Option<UnboundedSender<KoboldMessage>>>,
+  kobold_channels: DashMap<GuildId, UnboundedSender<KoboldMessage>>,
 }
 
 #[poise::command(slash_command, prefix_command)]
@@ -221,38 +207,58 @@ async fn mere(ctx: Context<'_>) -> CommandResult{
   if let Ok(handler_lock) = manager.join(guild_id.clone(), connect_to).await{
     let mut handler = handler_lock.lock().await;
 
-    let evt_receiver = Reciever::new(ctx.channel_id());
+    if let Some(kobold_tx) = ctx.data().kobold_channels.get(&guild_id){
+      let evt_receiver = Reciever::new(kobold_tx.value().clone(), ctx.channel_id());
 
-    handler.add_global_event(CoreEvent::DriverConnect.into(), evt_receiver.clone());
-    handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), evt_receiver.clone());
-    handler.add_global_event(CoreEvent::VoiceTick.into(), evt_receiver.clone());
-    //handler.add_global_event(CoreEvent::RtpPacket.into(), evt_receiver.clone());
+      handler.add_global_event(CoreEvent::DriverConnect.into(), evt_receiver.clone());
+      handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), evt_receiver.clone());
+      handler.add_global_event(CoreEvent::VoiceTick.into(), evt_receiver.clone());
 
-    //if let Some(kobold_guild) = ctx.data().kobold_channels.get_mut(&guild_id);
-
-    check_msg(ctx.reply(format!("Joined {}", connect_to.mention())).await);
+      check_msg(ctx.reply(format!("Joined {}", connect_to.mention())).await);
+    }
   }
 
   Ok(())
 }
 
 async fn poise_event_handler(
-  ctx: &serenity::Context,
+  _ctx: &serenity::Context,
   event: &serenity::FullEvent,
   framework: poise::FrameworkContext<'_, Data, Error>,
-  data: &Data,
+  _data: &Data,
 ) -> Result<(), Error>{
   match event {
     serenity::FullEvent::Ready { data_about_bot } => {
       data_about_bot.guilds.iter().for_each(|x|{
         if x.unavailable == false{
-          framework.user_data.kobold_channels.insert(x.id, None);
+          let kobold_tx = kobold::spawn_kobold_thread();
+          framework.user_data.kobold_channels.insert(x.id, kobold_tx);
         }
       });
     },
     serenity::FullEvent::Message{new_message} =>{
-      framework.user_data;
+      let guild_id = match new_message.guild_id{
+        Some(r) => r,
+        None => {
+          println!("Not able to get Guild ID from messge: {}", new_message.content);
+          return Ok(());
+        }
+      };
+      if let Some(kobold_ref) = framework.user_data.kobold_channels.get(&guild_id){
+        kobold_ref.value().send(KoboldMessage{
+          origin_channel: new_message.channel_id,
+          send: new_message.content.contains(
+            &std::env::var("ACTIVATION_PHRASE").unwrap()
+          ),
+          message: new_message.content.clone(),
+          author: new_message.author.id.get(),
+        })?;
+      }
     },
+    serenity::FullEvent::GuildCreate { guild, is_new: _ } => {
+      let kobold_tx = kobold::spawn_kobold_thread();
+      framework.user_data.kobold_channels.insert(guild.id, kobold_tx);
+    }
     _ => {}
   }
   Ok(())
@@ -274,6 +280,9 @@ fn get_framework_options() -> poise::FrameworkOptions<Data, Error>{
           Ok(true)
       })
     }),
+    event_handler: |ctx, event, framework, data|{
+      Box::pin(poise_event_handler(ctx, event, framework, data))
+    },
     ..Default::default()
   }
 }
@@ -300,27 +309,6 @@ fn check_msg<T>(result: serenity::Result<T>){
   }
 }
 
-fn _get_wav_data(speaker: Vec<i16>) -> Result<Vec<u8>, Error>{
-  let spec = hound::WavSpec {
-    channels: 2,
-    sample_rate: 48000,
-    bits_per_sample: 16,
-    sample_format: hound::SampleFormat::Int,
-  };
-  let mut hound_writer = hound::WavWriter::create("dummy.wav", spec).unwrap();
-  //let writer_len = speaker.buffer.len().try_into().unwrap();
-  //let mut writer = hound_writer.get_i16_writer(writer_len);
-  for sample in speaker.iter(){
-    hound_writer.write_sample(*sample)?
-  }
-  hound_writer.flush()?;
-  let mut f = File::options().read(true).open("dummy.wav").unwrap();
-  let mut buf = Vec::new();
-  let bytes_read = f.read_to_end(&mut buf)?;
-  println!("Bytes from dummy.wav: {}", bytes_read);
-  Ok(buf)
-}
-
 fn resample_discord_to_bytes(sound_data: Vec<i16>) -> Vec<u8>{
   let resampled: Vec<i16> = sound_data.chunks_exact(6).map(|x|{
     ((x[0] as i64 + x[2] as i64 + x[4] as i64)/3) as i16
@@ -330,21 +318,21 @@ fn resample_discord_to_bytes(sound_data: Vec<i16>) -> Vec<u8>{
   sound_bytes
 }
 
-async fn spawn_speaker_thread(discord_tx: UnboundedSender<KoboldMessage>, id: VoiceId) -> UnboundedSender<Vec<i16>>{
+async fn spawn_speaker_thread(kobold_tx: UnboundedSender<KoboldMessage>, id: VoiceId, channel: PoiseChannelId) -> UnboundedSender<Vec<i16>>{
   let(tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
   tokio::spawn(async move{
-    let local_tx = discord_tx.clone();
-    let mut write = spawn_whisper_thread(local_tx.clone(), id).await;
+    let local_tx = kobold_tx.clone();
+    let mut write = spawn_whisper_thread(local_tx.clone(), id, channel).await;
     while let Some(data) = rx.recv().await{
       let bytes = resample_discord_to_bytes(data);
       if let Err(_) = write.feed(TungsteniteMessage::binary(bytes.clone())).await{
-        write = spawn_whisper_thread(local_tx.clone(), id).await;
+        write = spawn_whisper_thread(local_tx.clone(), id, channel).await;
         write.feed(TungsteniteMessage::Binary(bytes)).await.expect("Unable to recreate whisper thread");
         write.flush().await.expect("Unable to recreate whisper thread");
         continue;
       }
       if let Err(_) = write.flush().await{
-        write = spawn_whisper_thread(local_tx.clone(), id).await;
+        write = spawn_whisper_thread(local_tx.clone(), id, channel).await;
         write.feed(TungsteniteMessage::Binary(bytes)).await.expect("Unable to recreate whisper thread");
         write.flush().await.expect("Unable to recreate whisper thread");
         continue;
@@ -352,50 +340,4 @@ async fn spawn_speaker_thread(discord_tx: UnboundedSender<KoboldMessage>, id: Vo
     }
   });
   tx
-}
-
-async fn spawn_whisper_thread(kobold_tx: UnboundedSender<KoboldMessage>, id: VoiceId) -> DiscordSink{
-  let(ws_stream, _) = connect_async(
-    std::env::var("WHISPER_URL").expect("Expected WHISPER_URL in the environment variables")
-  ).await.expect("Failed to connect to whisper server");
-  let (write, mut read) = ws_stream.split();
-  tokio::spawn(async move{
-    let mut full_transcription = String::new();
-    while let Some(mes_res) = read.next().await{
-      let mes = match mes_res{
-        Ok(r) => r,
-        Err(err) => {
-          println!("Error getting data from whisper server: {}", err);
-          break;
-        }
-      };
-      let json_text = match mes.into_text(){
-        Ok(r) => r,
-        Err(err) => {
-          println!("Data received from whisper server could not be made into utf-8 string: {}", err);
-          break;
-        }
-      };
-      let json_mes: WhisperResponse = match serde_json::from_str(&json_text){
-        Ok(r) => r,
-        Err(_) => {
-          //println!("Not able to put string from whisper server into a json object: {}", err);
-          break;
-        }
-      };
-      if json_mes.text != String::new(){
-        full_transcription = json_mes.text;
-      }
-    }
-    if full_transcription == String::new(){
-      return;
-    }
-    if let Err(err) = kobold_tx.send(KoboldMessage{
-      author: id.0,
-      message: full_transcription,
-    }){
-      println!("Error sending trascription message: {}", err);
-    };
-  });
-  write
 }
