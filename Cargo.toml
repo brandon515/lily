@@ -18,3 +18,4 @@ tokio = { version = "1.40.0", features = ["full", "sync"] }
 tokio-tungstenite = { version = "0.23.1"}
 dashmap = "6.0.1"
 hound = "3.5.1"
+dotenv = "0.15.0"
