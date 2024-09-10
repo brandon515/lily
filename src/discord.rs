@@ -81,7 +81,7 @@ impl Reciever{
     let kobold_tx = kobold::spawn_kobold_thread(discord_tx.clone());
     tokio::spawn(async move{
       let local_chan = thread_chan.clone();
-      let token = std::env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
+      let token = std::env::var("DISCORD_TOKEN").expect("Expected DISCORD_URL in the environment variables");
       let http = Http::new(&token);
       while let Some(generation) = discord_rx.recv().await{
         if let Err(err) = local_chan.say(&http, generation).await{
@@ -356,7 +356,7 @@ async fn spawn_speaker_thread(discord_tx: UnboundedSender<KoboldMessage>, id: Vo
 
 async fn spawn_whisper_thread(kobold_tx: UnboundedSender<KoboldMessage>, id: VoiceId) -> DiscordSink{
   let(ws_stream, _) = connect_async(
-    "ws://localhost:8000/v1/audio/transcriptions?language=en"
+    std::env::var("WHISPER_URL").expect("Expected WHISPER_URL in the environment variables")
   ).await.expect("Failed to connect to whisper server");
   let (write, mut read) = ws_stream.split();
   tokio::spawn(async move{

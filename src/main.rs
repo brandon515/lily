@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>>{
+    dotenv::dotenv().ok();
     tokio::spawn(async move {
         let token = std::env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
 

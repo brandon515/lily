@@ -166,7 +166,6 @@ const HEADER_START: &str = "<|start_header_id|>";
 const HEADER_END: &str = "<|end_header_id|>";
 const AI_DESC: &str = "You are a discord bot on a server called Big Gay Rock. You are speaking to the members of the server and will help them with whatever they ask.";
 const ACTIVATION_PHRASE: &str = "lily";
-const KOBOLD_URL: &str = "http://localhost:5001/api/extra/generate/stream";
 
 pub fn spawn_kobold_thread(output_tx: UnboundedSender<String>) -> UnboundedSender<KoboldMessage>{
   let (input_tx, mut input_rx) = tokio_channel::<KoboldMessage>();
@@ -197,7 +196,9 @@ pub fn spawn_kobold_thread(output_tx: UnboundedSender<String>) -> UnboundedSende
               continue;
             }
           };
-        let req = client.post(KOBOLD_URL)
+        let req = client.post(
+          std::env::var("KOBOLD_URL").expect("Expected KOBOLD_URL in the environment variables")
+        )
             .json(&data);
         let mut es = match EventSource::new(req){
           Ok(r) => r,
