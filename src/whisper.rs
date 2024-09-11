@@ -3,7 +3,6 @@ use crate::kobold::KoboldMessage;
 use tokio::sync::mpsc::UnboundedSender;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use songbird::model::id::UserId as VoiceId;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use ::serenity::all::ChannelId as PoiseChannelId;
 
@@ -17,7 +16,7 @@ type WhisperSink = futures_util::stream::SplitSink<
     tokio_tungstenite::MaybeTlsStream<
       tokio::net::TcpStream>>, TungsteniteMessage>;
 
-pub async fn spawn_whisper_thread(kobold_tx: UnboundedSender<KoboldMessage>, id: VoiceId, channel: PoiseChannelId) -> WhisperSink{
+pub async fn spawn_whisper_thread(kobold_tx: UnboundedSender<KoboldMessage>, display_name: String, channel: PoiseChannelId) -> WhisperSink{
   let(ws_stream, _) = connect_async(
     std::env::var("WHISPER_URL").expect("Expected WHISPER_URL in the environment variables")
   ).await.expect("Failed to connect to whisper server");
@@ -55,10 +54,7 @@ pub async fn spawn_whisper_thread(kobold_tx: UnboundedSender<KoboldMessage>, id:
     }
     if let Err(err) = kobold_tx.send(KoboldMessage{
       origin_channel: channel,
-      send: full_transcription.contains(
-        &std::env::var("ACTIVATION_PHRASE").expect("Expected ACTIVATION_PHRASE in the environment variables")
-      ),
-      author: id.0,
+      author: display_name,
       message: full_transcription,
     }){
       println!("Error sending trascription message: {}", err);

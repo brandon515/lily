@@ -2,15 +2,12 @@ use dashmap::DashMap;
 use poise::serenity_prelude as serenity;
 use ::serenity::{
   all::{
-    ChannelId as PoiseChannelId, GuildId, Http, Mentionable
+    ChannelId as PoiseChannelId, Guild, GuildId, Http, Mentionable, PartialGuild
   }, 
   async_trait
 };
 use songbird::{
-  model::{
-    id::UserId as VoiceId, 
-    payload::Speaking,
-  }, 
+  model::payload::Speaking,
   CoreEvent, EventContext, 
   EventHandler as VoiceEventHandler, 
   Songbird
@@ -52,11 +49,12 @@ type CommandResult = Result<(), Error>;
 pub struct Reciever{
   inner: Arc<InnerReceiver>,
   default_channel: PoiseChannelId,
+  guild: PartialGuild,
 }
 
 #[derive(Clone, Debug)]
 struct Speaker {
-  id: VoiceId,
+  id: String,
   message_send: Option<UnboundedSender<Vec<i16>>>,
 }
 
@@ -66,20 +64,25 @@ struct InnerReceiver{
   kobold_tx: UnboundedSender<KoboldMessage>,
 }
 
-pub async fn send_discord_message(message: String, channel: PoiseChannelId){
+fn get_http() -> Http{
   let token = std::env::var("DISCORD_TOKEN").expect("Expected DISCORD_URL in the environment variables");
-  let http = Http::new(&token);
+  Http::new(&token)
+}
+
+pub async fn send_discord_message(message: String, channel: PoiseChannelId){
+  let http = get_http();
   check_msg(channel.say(&http, message).await);
 }
 
 impl Reciever{
-  pub fn new(kobold_tx: UnboundedSender<KoboldMessage>, channel: PoiseChannelId) -> Self{
+  pub fn new(kobold_tx: UnboundedSender<KoboldMessage>, channel: PoiseChannelId, guild: PartialGuild) -> Self{
     Self { inner: Arc::new(InnerReceiver{
         last_tick_was_empty: AtomicBool::new(true),
         known_ssrcs: DashMap::new(),
         kobold_tx,
       }),
       default_channel: channel,
+      guild,
     }
   }
 }
@@ -99,11 +102,18 @@ impl VoiceEventHandler for Reciever{
       }) => {
         println!("Speaking state update: user {:?} has SSRC {:?}, using {:?}", user_id, ssrc, speaking);
         if let Some(user) = user_id{
+          let member = match self.guild.member(get_http(), serenity::all::UserId::new(user.0)).await{
+            Ok(r) => r,
+            Err(err) => {
+              println!("Not able to get user name with user id: {}", err);
+              return None;
+            }
+          };
           if let Some(mut existing_speaker) = self.inner.known_ssrcs.get_mut(&ssrc){
-            existing_speaker.id = *user;
+            existing_speaker.id = member.display_name().to_string();
           }else{
             self.inner.known_ssrcs.insert(*ssrc, Speaker { 
-              id: *user, 
+              id: member.display_name().to_string(), 
               message_send: None,
             });
           }
@@ -119,7 +129,7 @@ impl VoiceEventHandler for Reciever{
             Some(s) => s,
             None => {
               let new_speaker = Speaker{
-                id: VoiceId(0),
+                id: String::new(),
                 message_send: None,
               };
               self.inner.known_ssrcs.insert(*ssrc, new_speaker);
@@ -201,6 +211,7 @@ async fn mere(ctx: Context<'_>) -> CommandResult{
       return Ok(());
     }
   };
+  
 
   let manager = ctx.data().songbird.clone();
 
@@ -208,7 +219,11 @@ async fn mere(ctx: Context<'_>) -> CommandResult{
     let mut handler = handler_lock.lock().await;
 
     if let Some(kobold_tx) = ctx.data().kobold_channels.get(&guild_id){
-      let evt_receiver = Reciever::new(kobold_tx.value().clone(), ctx.channel_id());
+      let token = std::env::var("DISCORD_TOKEN").expect("Expected DISCORD_URL in the environment variables");
+      let http = Http::new(&token);
+      let partial_guild = Guild::get(http, guild_id).await?;
+
+      let evt_receiver = Reciever::new(kobold_tx.value().clone(), ctx.channel_id(), partial_guild);
 
       handler.add_global_event(CoreEvent::DriverConnect.into(), evt_receiver.clone());
       handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), evt_receiver.clone());
@@ -237,6 +252,9 @@ async fn poise_event_handler(
       });
     },
     serenity::FullEvent::Message{new_message} =>{
+      if new_message.author.bot{
+        return Ok(());
+      }
       let guild_id = match new_message.guild_id{
         Some(r) => r,
         None => {
@@ -247,11 +265,8 @@ async fn poise_event_handler(
       if let Some(kobold_ref) = framework.user_data.kobold_channels.get(&guild_id){
         kobold_ref.value().send(KoboldMessage{
           origin_channel: new_message.channel_id,
-          send: new_message.content.contains(
-            &std::env::var("ACTIVATION_PHRASE").unwrap()
-          ),
           message: new_message.content.clone(),
-          author: new_message.author.id.get(),
+          author: new_message.author.global_name.as_ref().unwrap().clone(),
         })?;
       }
     },
@@ -318,21 +333,21 @@ fn resample_discord_to_bytes(sound_data: Vec<i16>) -> Vec<u8>{
   sound_bytes
 }
 
-async fn spawn_speaker_thread(kobold_tx: UnboundedSender<KoboldMessage>, id: VoiceId, channel: PoiseChannelId) -> UnboundedSender<Vec<i16>>{
+async fn spawn_speaker_thread(kobold_tx: UnboundedSender<KoboldMessage>, display_name: String, channel: PoiseChannelId) -> UnboundedSender<Vec<i16>>{
   let(tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
   tokio::spawn(async move{
     let local_tx = kobold_tx.clone();
-    let mut write = spawn_whisper_thread(local_tx.clone(), id, channel).await;
+    let mut write = spawn_whisper_thread(local_tx.clone(), display_name.clone(), channel).await;
     while let Some(data) = rx.recv().await{
       let bytes = resample_discord_to_bytes(data);
       if let Err(_) = write.feed(TungsteniteMessage::binary(bytes.clone())).await{
-        write = spawn_whisper_thread(local_tx.clone(), id, channel).await;
+        write = spawn_whisper_thread(local_tx.clone(), display_name.clone(), channel).await;
         write.feed(TungsteniteMessage::Binary(bytes)).await.expect("Unable to recreate whisper thread");
         write.flush().await.expect("Unable to recreate whisper thread");
         continue;
       }
       if let Err(_) = write.flush().await{
-        write = spawn_whisper_thread(local_tx.clone(), id, channel).await;
+        write = spawn_whisper_thread(local_tx.clone(), display_name.clone(), channel).await;
         write.feed(TungsteniteMessage::Binary(bytes)).await.expect("Unable to recreate whisper thread");
         write.flush().await.expect("Unable to recreate whisper thread");
         continue;
