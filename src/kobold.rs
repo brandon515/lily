@@ -14,7 +14,7 @@ use tokio::sync::mpsc::{
   unbounded_channel as tokio_channel,
   UnboundedSender,
 };
-use crate::discord::send_discord_message;
+use crate::discord::{self, send_discord_message};
 use ::serenity::all::ChannelId as PoiseChannelId;
 
 #[derive(Serialize)]
@@ -167,23 +167,27 @@ const TEXT_START: &str = "<|begin_of_text|>";
 const TEXT_END: &str = "<|eot_id|>";
 const HEADER_START: &str = "<|start_header_id|>";
 const HEADER_END: &str = "<|end_header_id|>";
-const AI_DESC: &str = "You are a discord bot on a server called Big Gay Rock. You are speaking to the members of the server and will help them with whatever they ask.";
+const AI_DESC: &str = "You are a discord bot named Lily on a server called Big Gay Rock. You are speaking to the members of the server and will help them with whatever they ask.";
 
 pub fn spawn_kobold_thread() -> UnboundedSender<KoboldMessage> {
   let (input_tx, mut input_rx) = tokio_channel::<KoboldMessage>();
   tokio::spawn(async move{
     let mut prompts = Vec::new();
     while let Some(msg) = input_rx.recv().await{
+      let _ = msg.origin_channel.to_channel(discord::get_http()).await.unwrap().id();
       prompts.push(
         format!("{HEADER_START}user{HEADER_END}\n\n{}: {}{TEXT_END}", msg.author, msg.message)
       );
       if msg.message.to_lowercase().contains(
         &std::env::var("ACTIVATION_PHRASE").unwrap()
       ){
+        if let Err(err) = msg.origin_channel.broadcast_typing(discord::get_http()).await{
+          println!("Error trying to broadcast typing: {}", err);
+        }
         let mut headers = header::HeaderMap::new();
         headers.insert("accept", header::HeaderValue::from_static("application/json"));
         headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
-        prompts.push(format!("{HEADER_START}assistant{HEADER_END}\n\n"));
+        prompts.push(format!("{HEADER_START}assistant{HEADER_END}\n\nLily:"));
         let combined_prompts = prompts.join("");
         let new_prompt = format!(
           "{TEXT_START}{HEADER_START}system{HEADER_END}\n\n{AI_DESC}{TEXT_END}"
@@ -198,10 +202,14 @@ pub fn spawn_kobold_thread() -> UnboundedSender<KoboldMessage> {
               println!("Reqwest client can't be built: {}", err);
               continue;
             }
-          };
-        let req = client.post(
-          std::env::var("KOBOLD_URL").expect("Expected KOBOLD_URL in the environment variables")
-        )
+        };
+        //add the / at the end of the server url if it's not there
+        let mut kobold_server = std::env::var("KOBOLD_URL").unwrap();
+        if kobold_server.chars().last().unwrap() != '/'{
+          kobold_server.push('/');
+        }
+        kobold_server.push_str("api/extra/generate/stream");
+        let req = client.post(kobold_server)
             .json(&data);
         let mut es = match EventSource::new(req){
           Ok(r) => r,

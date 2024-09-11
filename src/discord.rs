@@ -64,7 +64,7 @@ struct InnerReceiver{
   kobold_tx: UnboundedSender<KoboldMessage>,
 }
 
-fn get_http() -> Http{
+pub fn get_http() -> Http{
   let token = std::env::var("DISCORD_TOKEN").expect("Expected DISCORD_URL in the environment variables");
   Http::new(&token)
 }
