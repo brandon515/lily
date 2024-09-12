@@ -1,6 +1,7 @@
 pub mod kobold;
 pub mod discord;
 pub mod whisper;
+pub mod storage;
 
 use songbird::{driver::DecodeMode, Songbird};
 use poise::serenity_prelude as serenity;
