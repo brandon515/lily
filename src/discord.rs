@@ -110,12 +110,23 @@ impl VoiceEventHandler for Reciever{
             }
           };
           if let Some(mut existing_speaker) = self.inner.known_ssrcs.get_mut(&ssrc){
-            existing_speaker.id = member.display_name().to_string();
+            if member.user.bot{
+              existing_speaker.id = "Bot".to_string();
+            }else{
+              existing_speaker.id = member.display_name().to_string();
+            }
           }else{
-            self.inner.known_ssrcs.insert(*ssrc, Speaker { 
-              id: member.display_name().to_string(), 
-              message_send: None,
-            });
+            if member.user.bot{
+              self.inner.known_ssrcs.insert(*ssrc, Speaker { 
+                id: "Bot".to_string(), 
+                message_send: None,
+              });
+            }else{
+              self.inner.known_ssrcs.insert(*ssrc, Speaker { 
+                id: member.user.global_name.unwrap(), 
+                message_send: None,
+              });
+            }
           }
         }
       },
@@ -128,7 +139,9 @@ impl VoiceEventHandler for Reciever{
           let mut speaker = match self.inner.known_ssrcs.get_mut(&ssrc){
             Some(s) => s,
             None => {
-              let new_speaker = Speaker{
+              println!("No SSRC for {}", ssrc);
+              return None;
+              /*let new_speaker = Speaker{
                 id: String::new(),
                 message_send: None,
               };
@@ -138,9 +151,12 @@ impl VoiceEventHandler for Reciever{
               }else{
                 println!("Failed to insert new speaker with SSRC {:?}", ssrc);
                 continue;
-              }
+              }*/
             }
           };
+          if speaker.id == "Bot"{
+            return None;
+          }
           if let Some(decoded_voice) = &data.decoded_voice {
             let tx = match &speaker.message_send{
               Some(r) => r,
