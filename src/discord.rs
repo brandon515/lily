@@ -235,9 +235,7 @@ async fn mere(ctx: Context<'_>) -> CommandResult{
     let mut handler = handler_lock.lock().await;
 
     if let Some(kobold_tx) = ctx.data().kobold_channels.get(&guild_id){
-      let token = std::env::var("DISCORD_TOKEN").expect("Expected DISCORD_URL in the environment variables");
-      let http = Http::new(&token);
-      let partial_guild = Guild::get(http, guild_id).await?;
+      let partial_guild = Guild::get(get_http(), guild_id).await?;
 
       let evt_receiver = Reciever::new(kobold_tx.value().clone(), ctx.channel_id(), partial_guild);
 
