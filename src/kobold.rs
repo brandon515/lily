@@ -77,6 +77,7 @@ struct KoboldData{
   mirostat: f32, //Maybe this one
   ignore_eos: bool,
   stream: bool,
+  max_length: u64,
 }
 
 impl KoboldData{
@@ -146,6 +147,7 @@ impl KoboldData{
       mirostat: 0.0, //Maybe this one
       ignore_eos: false,
       stream: true,
+      max_length: 512,
     }
   }
 }
@@ -208,7 +210,7 @@ pub fn spawn_kobold_thread(message_storage_channel: UnboundedSender<StorageMessa
       let data = KoboldData::new(prompt);
       let client = match reqwest::Client::builder()
         .default_headers(headers)
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(60))
         .build(){
           Ok(r) => r,
           Err(err) =>{
