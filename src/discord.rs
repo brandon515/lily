@@ -79,11 +79,24 @@ pub async fn start_broadcasting(channel_id: u64){
   }
 }
 
+fn split_string(codepoints_over: usize, original_string: String) -> (String, String){
+  (original_string.char_indices().rev().nth(codepoints_over).map(|(i, _)| &original_string[..i]).unwrap().to_string(),
+  original_string.char_indices().rev().nth(codepoints_over).map(|(i, _)| &original_string[i..]).unwrap().to_string())
+}
+
 pub async fn send_discord_message(message: String, channel_id: u64){
   let http = get_http();
   if let Ok(channel_op) = http.get_channel(channel_id.into()).await{
     if let Some(channel) = channel_op.guild(){
-      check_msg(channel.say(&http, message).await);
+      if let Err(err) = channel.say(&http, message.clone()).await{
+        if let serenity::Error::Model(serenity::ModelError::MessageTooLong(num_codepoints)) = err{
+          let (first, second) = split_string(num_codepoints, message);
+          check_msg(channel.say(&http, first).await);
+          check_msg(channel.say(&http, second).await);
+        }else{
+          println!("Unable to send message to discord: {}", err);
+        }
+      }
     }
   }
 }
@@ -109,12 +122,11 @@ impl VoiceEventHandler for Reciever{
         println!("Connected");
       },
       EventContext::SpeakingStateUpdate(Speaking{
-        speaking,
+        speaking: _,
         ssrc,
         user_id,
         ..
       }) => {
-        println!("Speaking state update: user {:?} has SSRC {:?}, using {:?}", user_id, ssrc, speaking);
         if let Some(user) = user_id{
           let member = match self.guild.member(get_http(), serenity::all::UserId::new(user.0)).await{
             Ok(r) => r,
@@ -150,15 +162,15 @@ impl VoiceEventHandler for Reciever{
         let _last_tick_was_empty = self.inner.last_tick_was_empty.load(Ordering::SeqCst);
 
         for (ssrc, data) in &tick.speaking {
-          let mut speaker = match self.inner.known_ssrcs.get_mut(&ssrc){
+          let mut speaker = match self.inner.known_ssrcs.get_mut(ssrc){
             Some(s) => s,
             None => {
               println!("No SSRC for {}", ssrc);
-              return None;
+              continue;
             }
           };
           if speaker.id == "Bot"{
-            return None;
+            continue;
           }
           if let Some(decoded_voice) = &data.decoded_voice {
             let tx = match &speaker.message_send{
@@ -178,7 +190,7 @@ impl VoiceEventHandler for Reciever{
                 println!("Err sending voice data over channel: {}", err);
               }
               let new_tx = spawn_speaker_thread(self.inner.storage_tx.clone(), speaker.id.clone(), self.default_channel.get()).await;
-              if let Err(err) = tx.send(decoded_voice.clone()){
+              if let Err(err) = new_tx.send(decoded_voice.clone()){
                 println!("Error creating new channel for voice data: {}", err);
                 speaker.message_send = None;
               }else{
@@ -187,6 +199,12 @@ impl VoiceEventHandler for Reciever{
             };
           }else{
             println!("Decode disabled");
+          }
+        }
+
+        for ssrc in &tick.silent{
+          if let Some(mut speaker) = self.inner.known_ssrcs.get_mut(ssrc){
+            speaker.message_send = None;
           }
         }
       },
