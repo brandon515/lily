@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
     std::env::var("KOBOLD_URL").expect("Expected KOBOLD_URL in the environment variables");
     std::env::var("WHISPER_URL").expect("Expected WHISPER_URL in the environment variables");
     std::env::var("ACTIVATION_PHRASE").expect("Expected ACTIVATION_PHRASE in the environment variables");
+    std::env::var("BOT_NAME").expect("Expected BOT_NAME in the environment variables");
     tokio::spawn(async move {
         let token = std::env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
 
