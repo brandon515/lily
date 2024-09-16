@@ -10,12 +10,14 @@ use serde::{
   Serialize,
   Deserialize,
 };
-use tokio::sync::mpsc::{
-  unbounded_channel as tokio_channel,
-  UnboundedSender,
+use tokio::sync::mpsc::UnboundedSender;
+use crate::{
+  discord::{
+    send_discord_message, 
+    start_broadcasting
+  },
+  storage::StorageMessage,
 };
-use crate::discord::{self, send_discord_message};
-use ::serenity::all::ChannelId as PoiseChannelId;
 
 #[derive(Serialize)]
 struct KoboldData{
@@ -157,8 +159,7 @@ struct KoboldResponse{
 }
 
 #[derive(Debug)]
-pub struct KoboldMessage{
-  pub origin_channel: PoiseChannelId,
+pub struct StoredMessage{
   pub message: String,
   pub author: String,
 }
@@ -169,86 +170,84 @@ const HEADER_START: &str = "<|start_header_id|>";
 const HEADER_END: &str = "<|end_header_id|>";
 const AI_DESC: &str = "You are a discord bot named Lily on a server called Big Gay Rock. You are speaking to the members of the server and will help them with whatever they ask.";
 
-pub fn spawn_kobold_thread() -> UnboundedSender<KoboldMessage> {
-  let (input_tx, mut input_rx) = tokio_channel::<KoboldMessage>();
+pub fn spawn_kobold_thread(origin_channel: u64, messages: Vec<StoredMessage>, message_storage_channel: UnboundedSender<StorageMessage>){
   tokio::spawn(async move{
-    let mut prompts = Vec::new();
-    while let Some(msg) = input_rx.recv().await{
-      let _ = msg.origin_channel.to_channel(discord::get_http()).await.unwrap().id();
-      prompts.push(
-        format!("{HEADER_START}user{HEADER_END}\n\n{}: {}{TEXT_END}", msg.author, msg.message)
-      );
-      if msg.message.to_lowercase().contains(
-        &std::env::var("ACTIVATION_PHRASE").unwrap()
-      ){
-        if let Err(err) = msg.origin_channel.broadcast_typing(discord::get_http()).await{
-          println!("Error trying to broadcast typing: {}", err);
+    start_broadcasting(origin_channel).await;
+    let bot_name = std::env::var("BOT_NAME").unwrap();
+    let new_prompt = format!(
+      "{TEXT_START}{HEADER_START}system{HEADER_END}\n\n{AI_DESC}{TEXT_END}"
+    );
+    let kobold_messages: Vec<String> = messages.iter().map(|msg| {
+      format!("{HEADER_START}user{HEADER_END}\n\n{}: {}{TEXT_END}", msg.author, msg.message)
+    }).collect();
+    let context_messages = kobold_messages.join("");
+
+    let ai_start = format!("{HEADER_START}assistant{HEADER_END}\n\n{bot_name}:");
+    let prompt = new_prompt + &context_messages + &ai_start;
+    
+    let mut headers = header::HeaderMap::new();
+    headers.insert("accept", header::HeaderValue::from_static("application/json"));
+    headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
+    let data = KoboldData::new(prompt);
+    let client = match reqwest::Client::builder()
+      .default_headers(headers)
+      .build(){
+        Ok(r) => r,
+        Err(err) =>{
+          println!("Reqwest client can't be built: {}", err);
+          return;
         }
-        let mut headers = header::HeaderMap::new();
-        headers.insert("accept", header::HeaderValue::from_static("application/json"));
-        headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
-        prompts.push(format!("{HEADER_START}assistant{HEADER_END}\n\nLily:"));
-        let combined_prompts = prompts.join("");
-        let new_prompt = format!(
-          "{TEXT_START}{HEADER_START}system{HEADER_END}\n\n{AI_DESC}{TEXT_END}"
-        );
-        let prompt = new_prompt + &combined_prompts;
-        let data = KoboldData::new(prompt);
-        let client = match reqwest::Client::builder()
-          .default_headers(headers)
-          .build(){
-            Ok(r) => r,
-            Err(err) =>{
-              println!("Reqwest client can't be built: {}", err);
+    };
+    //add the / at the end of the server url if it's not there
+    let mut kobold_server = std::env::var("KOBOLD_URL").unwrap();
+    if kobold_server.chars().last().unwrap() != '/'{
+      kobold_server.push('/');
+    }
+    kobold_server.push_str("api/extra/generate/stream");
+    let req = client.post(kobold_server)
+        .json(&data);
+    let mut es = match EventSource::new(req){
+      Ok(r) => r,
+      Err(err) => {
+        println!("Error creating EventSource to KoboldCPP: {}", err);
+        return;
+      }
+    };
+    let mut final_generation = String::new();
+    while let Some(event) = es.next().await{
+      match event{
+        Ok(KoboldEvent::Open) => {},
+        Ok(KoboldEvent::Message(ev)) => {
+          match serde_json::from_str::<KoboldResponse>(&ev.data){
+            Ok(r) => {
+              final_generation.push_str(&r.token);
+              if r.finish_reason == "stop"{
+                break;
+              }
+            },
+            Err(err) => {
+              println!("Malformed response from KoboldCPP: {}", err);
+              println!("\tresponse: {:?}", ev.data);
               continue;
             }
-        };
-        //add the / at the end of the server url if it's not there
-        let mut kobold_server = std::env::var("KOBOLD_URL").unwrap();
-        if kobold_server.chars().last().unwrap() != '/'{
-          kobold_server.push('/');
-        }
-        kobold_server.push_str("api/extra/generate/stream");
-        let req = client.post(kobold_server)
-            .json(&data);
-        let mut es = match EventSource::new(req){
-          Ok(r) => r,
-          Err(err) => {
-            println!("Error creating EventSource to KoboldCPP: {}", err);
-            continue;
+          };
+        },
+        Err(err) =>{
+          if err.to_string() != "Stream ended"{
+            println!("Error in connection to KoboldCPP: {}", err);
           }
-        };
-        let mut final_generation = String::new();
-        while let Some(event) = es.next().await{
-          match event{
-            Ok(KoboldEvent::Open) => println!("Kobold connection opened"),
-            Ok(KoboldEvent::Message(ev)) => {
-              match serde_json::from_str::<KoboldResponse>(&ev.data){
-                Ok(r) => {
-                  final_generation.push_str(&r.token);
-                  if r.finish_reason == "stop"{
-                    break;
-                  }
-                },
-                Err(err) => {
-                  println!("Malformed response from KoboldCPP: {}", err);
-                  println!("\tresponse: {:?}", ev.data);
-                  continue;
-                }
-              };
-            },
-            Err(err) =>{
-              if err.to_string() != "Stream ended"{
-                println!("Error in connection to KoboldCPP: {}", err);
-              }
-              break;
-            }
-          }
+          break;
         }
-        prompts.push(format!("{final_generation}{TEXT_END}"));
-        send_discord_message(final_generation, msg.origin_channel).await;
       }
     }
+    //prompts.push(format!("{final_generation}{TEXT_END}"));
+    send_discord_message(final_generation.clone(), origin_channel).await;
+    if let Err(err) = message_storage_channel.send(StorageMessage{
+      message: final_generation,
+      author: bot_name.to_string(),
+      channel: origin_channel,
+    }){
+      println!("Unable to send kobold generation to storage thread: {}", err);
+    }
   });
-  input_tx
 }

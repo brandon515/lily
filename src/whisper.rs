@@ -1,10 +1,9 @@
 use tokio_tungstenite::connect_async;
-use crate::kobold::KoboldMessage;
 use tokio::sync::mpsc::UnboundedSender;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
-use ::serenity::all::ChannelId as PoiseChannelId;
+use crate::storage::StorageMessage;
 
 #[derive(Deserialize)]
 struct WhisperResponse{
@@ -16,7 +15,7 @@ type WhisperSink = futures_util::stream::SplitSink<
     tokio_tungstenite::MaybeTlsStream<
       tokio::net::TcpStream>>, TungsteniteMessage>;
 
-pub async fn spawn_whisper_thread(kobold_tx: UnboundedSender<KoboldMessage>, display_name: String, channel: PoiseChannelId) -> WhisperSink{
+pub async fn spawn_whisper_thread(storage_tx: UnboundedSender<StorageMessage>, display_name: String, channel: u64) -> WhisperSink{
   let(ws_stream, _) = connect_async(
     std::env::var("WHISPER_URL").expect("Expected WHISPER_URL in the environment variables")
   ).await.expect("Failed to connect to whisper server");
@@ -52,8 +51,8 @@ pub async fn spawn_whisper_thread(kobold_tx: UnboundedSender<KoboldMessage>, dis
     if full_transcription == String::new(){
       return;
     }
-    if let Err(err) = kobold_tx.send(KoboldMessage{
-      origin_channel: channel,
+    if let Err(err) = storage_tx.send(StorageMessage{
+      channel,
       author: display_name,
       message: full_transcription,
     }){

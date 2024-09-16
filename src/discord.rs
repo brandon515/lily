@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use poise::serenity_prelude as serenity;
 use ::serenity::{
   all::{
-    ChannelId as PoiseChannelId, Guild, GuildId, Http, Mentionable, PartialGuild
+    ChannelId as PoiseChannelId, Guild, Http, Mentionable, PartialGuild
   }, 
   async_trait
 };
@@ -16,8 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use std::{
-  fmt::Debug,
-  sync::{
+  fmt::Debug, sync::{
     atomic::{
       AtomicBool, 
       Ordering,
@@ -28,10 +27,10 @@ use std::{
 
 use crate::{
   whisper::spawn_whisper_thread,
-  kobold::{
-    self, 
-    KoboldMessage
-  }
+  storage::{
+    StorageMessage,
+    create_storage_thread,
+  },
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -61,7 +60,7 @@ struct Speaker {
 struct InnerReceiver{
   last_tick_was_empty: AtomicBool,
   known_ssrcs: dashmap::DashMap<u32, Speaker>,
-  kobold_tx: UnboundedSender<KoboldMessage>,
+  storage_tx: UnboundedSender<StorageMessage>,
 }
 
 pub fn get_http() -> Http{
@@ -69,17 +68,32 @@ pub fn get_http() -> Http{
   Http::new(&token)
 }
 
-pub async fn send_discord_message(message: String, channel: PoiseChannelId){
+pub async fn start_broadcasting(channel_id: u64){
   let http = get_http();
-  check_msg(channel.say(&http, message).await);
+  if let Ok(channel_op) = http.get_channel(channel_id.into()).await{
+    if let Some(channel) = channel_op.guild(){
+      if let Err(err) = channel.broadcast_typing(&http).await{
+        println!("Unable to broadcast typing: {}", err);
+      }
+    }
+  }
+}
+
+pub async fn send_discord_message(message: String, channel_id: u64){
+  let http = get_http();
+  if let Ok(channel_op) = http.get_channel(channel_id.into()).await{
+    if let Some(channel) = channel_op.guild(){
+      check_msg(channel.say(&http, message).await);
+    }
+  }
 }
 
 impl Reciever{
-  pub fn new(kobold_tx: UnboundedSender<KoboldMessage>, channel: PoiseChannelId, guild: PartialGuild) -> Self{
+  pub fn new(storage_tx: UnboundedSender<StorageMessage>, channel: PoiseChannelId, guild: PartialGuild) -> Self{
     Self { inner: Arc::new(InnerReceiver{
         last_tick_was_empty: AtomicBool::new(true),
         known_ssrcs: DashMap::new(),
-        kobold_tx,
+        storage_tx,
       }),
       default_channel: channel,
       guild,
@@ -141,17 +155,6 @@ impl VoiceEventHandler for Reciever{
             None => {
               println!("No SSRC for {}", ssrc);
               return None;
-              /*let new_speaker = Speaker{
-                id: String::new(),
-                message_send: None,
-              };
-              self.inner.known_ssrcs.insert(*ssrc, new_speaker);
-              if let Some(s) = self.inner.known_ssrcs.get_mut(&ssrc){
-                s
-              }else{
-                println!("Failed to insert new speaker with SSRC {:?}", ssrc);
-                continue;
-              }*/
             }
           };
           if speaker.id == "Bot"{
@@ -161,7 +164,7 @@ impl VoiceEventHandler for Reciever{
             let tx = match &speaker.message_send{
               Some(r) => r,
               None => {
-                speaker.message_send = Some(spawn_speaker_thread(self.inner.kobold_tx.clone(), speaker.id.clone(), self.default_channel).await);
+                speaker.message_send = Some(spawn_speaker_thread(self.inner.storage_tx.clone(), speaker.id.clone(), self.default_channel.get()).await);
                 if let Some(r) = &speaker.message_send{
                   r
                 }else{
@@ -174,7 +177,7 @@ impl VoiceEventHandler for Reciever{
               if err.to_string() != "channel closed"{
                 println!("Err sending voice data over channel: {}", err);
               }
-              let new_tx = spawn_speaker_thread(self.inner.kobold_tx.clone(), speaker.id.clone(), self.default_channel).await;
+              let new_tx = spawn_speaker_thread(self.inner.storage_tx.clone(), speaker.id.clone(), self.default_channel.get()).await;
               if let Err(err) = tx.send(decoded_voice.clone()){
                 println!("Error creating new channel for voice data: {}", err);
                 speaker.message_send = None;
@@ -195,7 +198,7 @@ impl VoiceEventHandler for Reciever{
 
 pub struct Data {
   songbird: Arc<Songbird>,
-  kobold_channels: DashMap<GuildId, UnboundedSender<KoboldMessage>>,
+  storage_tx: UnboundedSender<StorageMessage>,
 }
 
 #[poise::command(slash_command, prefix_command)]
@@ -234,17 +237,15 @@ async fn mere(ctx: Context<'_>) -> CommandResult{
   if let Ok(handler_lock) = manager.join(guild_id.clone(), connect_to).await{
     let mut handler = handler_lock.lock().await;
 
-    if let Some(kobold_tx) = ctx.data().kobold_channels.get(&guild_id){
-      let partial_guild = Guild::get(get_http(), guild_id).await?;
+    let partial_guild = Guild::get(get_http(), guild_id).await?;
 
-      let evt_receiver = Reciever::new(kobold_tx.value().clone(), ctx.channel_id(), partial_guild);
+    let evt_receiver = Reciever::new(ctx.data().storage_tx.clone(), ctx.channel_id(), partial_guild);
 
-      handler.add_global_event(CoreEvent::DriverConnect.into(), evt_receiver.clone());
-      handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), evt_receiver.clone());
-      handler.add_global_event(CoreEvent::VoiceTick.into(), evt_receiver.clone());
+    handler.add_global_event(CoreEvent::DriverConnect.into(), evt_receiver.clone());
+    handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), evt_receiver.clone());
+    handler.add_global_event(CoreEvent::VoiceTick.into(), evt_receiver.clone());
 
-      check_msg(ctx.reply(format!("Joined {}", connect_to.mention())).await);
-    }
+    check_msg(ctx.reply(format!("Joined {}", connect_to.mention())).await);
   }
 
   Ok(())
@@ -253,41 +254,20 @@ async fn mere(ctx: Context<'_>) -> CommandResult{
 async fn poise_event_handler(
   _ctx: &serenity::Context,
   event: &serenity::FullEvent,
-  framework: poise::FrameworkContext<'_, Data, Error>,
-  _data: &Data,
+  _framework: poise::FrameworkContext<'_, Data, Error>,
+  data: &Data,
 ) -> Result<(), Error>{
   match event {
-    serenity::FullEvent::Ready { data_about_bot } => {
-      data_about_bot.guilds.iter().for_each(|x|{
-        if x.unavailable == false{
-          let kobold_tx = kobold::spawn_kobold_thread();
-          framework.user_data.kobold_channels.insert(x.id, kobold_tx);
-        }
-      });
-    },
     serenity::FullEvent::Message{new_message} =>{
       if new_message.author.bot{
         return Ok(());
       }
-      let guild_id = match new_message.guild_id{
-        Some(r) => r,
-        None => {
-          println!("Not able to get Guild ID from messge: {}", new_message.content);
-          return Ok(());
-        }
-      };
-      if let Some(kobold_ref) = framework.user_data.kobold_channels.get(&guild_id){
-        kobold_ref.value().send(KoboldMessage{
-          origin_channel: new_message.channel_id,
-          message: new_message.content.clone(),
-          author: new_message.author.global_name.as_ref().unwrap().clone(),
-        })?;
-      }
+      data.storage_tx.send(StorageMessage{
+        channel: new_message.channel_id.get(),
+        message: new_message.content.clone(),
+        author: new_message.author.global_name.as_ref().unwrap().clone(),
+      })?;
     },
-    serenity::FullEvent::GuildCreate { guild, is_new: _ } => {
-      let kobold_tx = kobold::spawn_kobold_thread();
-      framework.user_data.kobold_channels.insert(guild.id, kobold_tx);
-    }
     _ => {}
   }
   Ok(())
@@ -325,7 +305,7 @@ pub fn get_framework(songbird: Arc<Songbird>) -> poise::Framework<Data, Error>{
             poise::builtins::register_globally(ctx, &framework.options().commands).await?;
             Ok(Data {
               songbird,
-              kobold_channels: DashMap::new(),
+              storage_tx: create_storage_thread(),
             })
         })
     })
@@ -347,7 +327,7 @@ fn resample_discord_to_bytes(sound_data: Vec<i16>) -> Vec<u8>{
   sound_bytes
 }
 
-async fn spawn_speaker_thread(kobold_tx: UnboundedSender<KoboldMessage>, display_name: String, channel: PoiseChannelId) -> UnboundedSender<Vec<i16>>{
+async fn spawn_speaker_thread(kobold_tx: UnboundedSender<StorageMessage>, display_name: String, channel: u64) -> UnboundedSender<Vec<i16>>{
   let(tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
   tokio::spawn(async move{
     let local_tx = kobold_tx.clone();
