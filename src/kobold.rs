@@ -1,11 +1,6 @@
-use std::vec;
+use std::{time::Duration, vec};
 
-use reqwest::header;
-use reqwest_eventsource::{
-  EventSource,
-  Event as KoboldEvent,
-};
-use futures_util::StreamExt;
+use reqwest::{header, StatusCode};
 use serde::{
   Serialize,
   Deserialize,
@@ -152,10 +147,20 @@ impl KoboldData{
   }
 }
 
+#[derive(Deserialize, Debug)]
+struct KoboldError{
+  msg: String,
+  r#type: String
+}
+
 #[derive(Deserialize)]
 struct KoboldResponse{
-  token: String,
-  finish_reason: String,
+  results: Vec<KoboldGeneration>,
+}
+
+#[derive(Deserialize)]
+struct KoboldGeneration{
+  text: String,
 }
 
 #[derive(Debug)]
@@ -191,6 +196,7 @@ pub fn spawn_kobold_thread(origin_channel: u64, messages: Vec<StoredMessage>, me
     let data = KoboldData::new(prompt);
     let client = match reqwest::Client::builder()
       .default_headers(headers)
+      .timeout(Duration::from_secs(30))
       .build(){
         Ok(r) => r,
         Err(err) =>{
@@ -203,51 +209,38 @@ pub fn spawn_kobold_thread(origin_channel: u64, messages: Vec<StoredMessage>, me
     if kobold_server.chars().last().unwrap() != '/'{
       kobold_server.push('/');
     }
-    kobold_server.push_str("api/extra/generate/stream");
-    let req = client.post(kobold_server)
-        .json(&data);
-    let mut es = match EventSource::new(req){
-      Ok(r) => r,
-      Err(err) => {
-        println!("Error creating EventSource to KoboldCPP: {}", err);
-        return;
-      }
-    };
-    let mut final_generation = String::new();
-    while let Some(event) = es.next().await{
-      match event{
-        Ok(KoboldEvent::Open) => {},
-        Ok(KoboldEvent::Message(ev)) => {
-          match serde_json::from_str::<KoboldResponse>(&ev.data){
-            Ok(r) => {
-              final_generation.push_str(&r.token);
-              if r.finish_reason == "stop"{
-                break;
-              }
-            },
-            Err(err) => {
-              println!("Malformed response from KoboldCPP: {}", err);
-              println!("\tresponse: {:?}", ev.data);
-              continue;
-            }
-          };
-        },
-        Err(err) =>{
-          if err.to_string() != "Stream ended"{
-            println!("Error in connection to KoboldCPP: {}", err);
-          }
-          break;
+    kobold_server.push_str("api/v1/generate");
+    let res = match client.post(kobold_server)
+        .json(&data)
+        .send()
+        .await{
+          Ok(r) => r,
+          Err(err) => {
+            println!("Unable to request from Kobold Server: {}", err);
+            send_discord_message("The KoboldCPP server is down".to_string(), origin_channel).await;
+            return;
+          },
+        };
+    
+    if res.status() == StatusCode::OK{
+      let res_json: KoboldResponse = res.json().await.unwrap();
+      for x in res_json.results.iter(){
+        send_discord_message(x.text.clone(), origin_channel).await;
+        if let Err(err) = message_storage_channel.send(StorageMessage{
+          message: x.text.clone(),
+          author: bot_name.to_string(),
+          channel: origin_channel,
+        }){
+          println!("Unable to send kobold generation to storage thread: {}", err);
         }
       }
-    }
-    //prompts.push(format!("{final_generation}{TEXT_END}"));
-    send_discord_message(final_generation.clone(), origin_channel).await;
-    if let Err(err) = message_storage_channel.send(StorageMessage{
-      message: final_generation,
-      author: bot_name.to_string(),
-      channel: origin_channel,
-    }){
-      println!("Unable to send kobold generation to storage thread: {}", err);
+    }else if res.status() == StatusCode::SERVICE_UNAVAILABLE{
+      let res_json: KoboldError = res.json().await.unwrap();
+      println!("KoboldCPP Server is busy");
+      println!("\tmsg: {}", res_json.msg);
+      println!("\ttype: {}", res_json.r#type);
+    }else{
+      println!("Something weird happened: {:?}", res);
     }
   });
 }
