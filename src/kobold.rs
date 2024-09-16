@@ -5,7 +5,10 @@ use serde::{
   Serialize,
   Deserialize,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{
+  UnboundedSender,
+  unbounded_channel as tokio_channel,
+};
 use crate::{
   discord::{
     send_discord_message, 
@@ -163,6 +166,11 @@ struct KoboldGeneration{
   text: String,
 }
 
+pub struct KoboldRequest{
+  pub origin_channel: u64,
+  pub messages: Vec<StoredMessage>,
+}
+
 #[derive(Debug)]
 pub struct StoredMessage{
   pub message: String,
@@ -175,72 +183,78 @@ const HEADER_START: &str = "<|start_header_id|>";
 const HEADER_END: &str = "<|end_header_id|>";
 const AI_DESC: &str = "You are a discord bot named Lily on a server called Big Gay Rock. You are speaking to the members of the server and will help them with whatever they ask.";
 
-pub fn spawn_kobold_thread(origin_channel: u64, messages: Vec<StoredMessage>, message_storage_channel: UnboundedSender<StorageMessage>){
+pub fn spawn_kobold_thread(message_storage_channel: UnboundedSender<StorageMessage>) -> UnboundedSender<KoboldRequest>{
+  let (kobold_tx, mut kobold_rx) = tokio_channel::<KoboldRequest>();
   tokio::spawn(async move{
-    start_broadcasting(origin_channel).await;
-    let bot_name = std::env::var("BOT_NAME").unwrap();
-    let new_prompt = format!(
-      "{TEXT_START}{HEADER_START}system{HEADER_END}\n\n{AI_DESC}{TEXT_END}"
-    );
-    let kobold_messages: Vec<String> = messages.iter().map(|msg| {
-      format!("{HEADER_START}user{HEADER_END}\n\n{}: {}{TEXT_END}", msg.author, msg.message)
-    }).collect();
-    let context_messages = kobold_messages.join("");
+    while let Some(kobold_req) = kobold_rx.recv().await{
+      let origin_channel = kobold_req.origin_channel;
+      let messages = kobold_req.messages;
+      start_broadcasting(origin_channel).await;
+      let bot_name = std::env::var("BOT_NAME").unwrap();
+      let new_prompt = format!(
+        "{TEXT_START}{HEADER_START}system{HEADER_END}\n\n{AI_DESC}{TEXT_END}"
+      );
+      let kobold_messages: Vec<String> = messages.iter().map(|msg| {
+        format!("{HEADER_START}user{HEADER_END}\n\n{}: {}{TEXT_END}", msg.author, msg.message)
+      }).collect();
+      let context_messages = kobold_messages.join("");
 
-    let ai_start = format!("{HEADER_START}assistant{HEADER_END}\n\n{bot_name}:");
-    let prompt = new_prompt + &context_messages + &ai_start;
-    
-    let mut headers = header::HeaderMap::new();
-    headers.insert("accept", header::HeaderValue::from_static("application/json"));
-    headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
-    let data = KoboldData::new(prompt);
-    let client = match reqwest::Client::builder()
-      .default_headers(headers)
-      .timeout(Duration::from_secs(30))
-      .build(){
-        Ok(r) => r,
-        Err(err) =>{
-          println!("Reqwest client can't be built: {}", err);
-          return;
-        }
-    };
-    //add the / at the end of the server url if it's not there
-    let mut kobold_server = std::env::var("KOBOLD_URL").unwrap();
-    if kobold_server.chars().last().unwrap() != '/'{
-      kobold_server.push('/');
-    }
-    kobold_server.push_str("api/v1/generate");
-    let res = match client.post(kobold_server)
-        .json(&data)
-        .send()
-        .await{
+      let ai_start = format!("{HEADER_START}assistant{HEADER_END}\n\n{bot_name}:");
+      let prompt = new_prompt + &context_messages + &ai_start;
+      
+      let mut headers = header::HeaderMap::new();
+      headers.insert("accept", header::HeaderValue::from_static("application/json"));
+      headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
+      let data = KoboldData::new(prompt);
+      let client = match reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(30))
+        .build(){
           Ok(r) => r,
-          Err(err) => {
-            println!("Unable to request from Kobold Server: {}", err);
-            send_discord_message("The KoboldCPP server is down".to_string(), origin_channel).await;
+          Err(err) =>{
+            println!("Reqwest client can't be built: {}", err);
             return;
-          },
-        };
-    
-    if res.status() == StatusCode::OK{
-      let res_json: KoboldResponse = res.json().await.unwrap();
-      for x in res_json.results.iter(){
-        send_discord_message(x.text.clone(), origin_channel).await;
-        if let Err(err) = message_storage_channel.send(StorageMessage{
-          message: x.text.clone(),
-          author: bot_name.to_string(),
-          channel: origin_channel,
-        }){
-          println!("Unable to send kobold generation to storage thread: {}", err);
-        }
+          }
+      };
+      //add the / at the end of the server url if it's not there
+      let mut kobold_server = std::env::var("KOBOLD_URL").unwrap();
+      if kobold_server.chars().last().unwrap() != '/'{
+        kobold_server.push('/');
       }
-    }else if res.status() == StatusCode::SERVICE_UNAVAILABLE{
-      let res_json: KoboldError = res.json().await.unwrap();
-      println!("KoboldCPP Server is busy");
-      println!("\tmsg: {}", res_json.msg);
-      println!("\ttype: {}", res_json.r#type);
-    }else{
-      println!("Something weird happened: {:?}", res);
+      kobold_server.push_str("api/v1/generate");
+      let res = match client.post(kobold_server)
+          .json(&data)
+          .send()
+          .await{
+            Ok(r) => r,
+            Err(err) => {
+              println!("Unable to request from Kobold Server: {}", err);
+              send_discord_message("The KoboldCPP server is down".to_string(), origin_channel).await;
+              continue;
+            },
+          };
+      
+      if res.status() == StatusCode::OK{
+        let res_json: KoboldResponse = res.json().await.unwrap();
+        for x in res_json.results.iter(){
+          send_discord_message(x.text.clone(), origin_channel).await;
+          if let Err(err) = message_storage_channel.send(StorageMessage{
+            message: x.text.clone(),
+            author: bot_name.to_string(),
+            channel: origin_channel,
+          }){
+            println!("Unable to send kobold generation to storage thread: {}", err);
+          }
+        }
+      }else if res.status() == StatusCode::SERVICE_UNAVAILABLE{
+        let res_json: KoboldError = res.json().await.unwrap();
+        println!("KoboldCPP Server is busy");
+        println!("\tmsg: {}", res_json.msg);
+        println!("\ttype: {}", res_json.r#type);
+      }else{
+        println!("Something weird happened: {:?}", res);
+      }
     }
   });
+  kobold_tx
 }

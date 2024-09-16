@@ -8,8 +8,7 @@ use tokio::sync::mpsc::{
 };
 
 use crate::kobold::{
-  StoredMessage,
-  spawn_kobold_thread,
+  spawn_kobold_thread, KoboldRequest, StoredMessage
 };
 
 #[derive(Debug, Clone)]
@@ -21,7 +20,7 @@ pub struct StorageMessage{
 
 pub fn create_storage_thread() -> UnboundedSender<StorageMessage>{
   let (sqlite_tx, mut sqlite_rx) = tokio_channel::<StorageMessage>();
-  let thread_tx = sqlite_tx.clone();
+  let kobold_tx = spawn_kobold_thread(sqlite_tx.clone());
   tokio::spawn(async move{
     let conn = Connection::open("./memory.db").expect("Not able to open SQLITE db called memory.db");
     conn.execute(
@@ -60,10 +59,12 @@ pub fn create_storage_thread() -> UnboundedSender<StorageMessage>{
             }
           };
         let messages: Vec<StoredMessage> = stored_message_iter.map(|x| {x.unwrap()}).collect();
-        spawn_kobold_thread(
-          possible_activation_message.channel, 
-          messages, 
-          thread_tx.clone());
+        if let Err(err) = kobold_tx.send(KoboldRequest{
+          origin_channel: possible_activation_message.channel,
+          messages,
+        }){
+          println!("Unable to send context to kobold thread: {}", err);
+        }
       }
     }
   });
