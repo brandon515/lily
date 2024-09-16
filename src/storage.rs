@@ -40,8 +40,8 @@ pub fn create_storage_thread() -> UnboundedSender<StorageMessage>{
       )){
         println!("Can't insert message into SQLITE3 database: {}", err);
       }
-      let activation_phrase = std::env::var("ACTIVATION_PHRASE").unwrap();
-      if possible_activation_message.message.contains(&activation_phrase){
+      let activation_phrase = std::env::var("ACTIVATION_PHRASE").unwrap().to_lowercase();
+      if possible_activation_message.message.to_lowercase().contains(&activation_phrase){
         let mut stmt = conn.prepare("SELECT author, message FROM messages WHERE channel=?1").unwrap();
         let stored_message_iter = match stmt.query_map(
           params![possible_activation_message.channel], 
