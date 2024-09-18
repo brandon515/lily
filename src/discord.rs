@@ -313,8 +313,7 @@ fn get_framework_options() -> poise::FrameworkOptions<Data, Error>{
     prefix_options: poise::PrefixFrameworkOptions{
       prefix: Some("~".to_string()),
       additional_prefixes: vec![
-        poise::Prefix::Literal("Hey Shodan"),
-        poise::Prefix::Literal("Hey Shodan,"),
+        poise::Prefix::Literal("Hey Bot"),
       ],
       ..Default::default()
     },
