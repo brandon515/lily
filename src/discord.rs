@@ -12,7 +12,7 @@ use songbird::{
   EventHandler as VoiceEventHandler, 
   Songbird
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc::UnboundedSender, Mutex as TokioMutex};
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use std::{
@@ -26,11 +26,9 @@ use std::{
 };
 
 use crate::{
-  whisper::spawn_whisper_thread,
   storage::{
-    StorageMessage,
-    create_storage_thread,
-  },
+    create_storage_thread, StorageMessage
+  }, whisper::{spawn_whisper_thread, WhisperSink}
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -51,10 +49,10 @@ pub struct Reciever{
   guild: PartialGuild,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Speaker {
   id: String,
-  message_send: Option<UnboundedSender<Vec<i16>>>,
+  message_send: Option<TokioMutex<WhisperSink>>,
 }
 
 struct InnerReceiver{
@@ -122,7 +120,6 @@ impl VoiceEventHandler for Reciever{
         println!("Connected");
       },
       EventContext::SpeakingStateUpdate(Speaking{
-        speaking: _,
         ssrc,
         user_id,
         ..
@@ -173,29 +170,43 @@ impl VoiceEventHandler for Reciever{
             continue;
           }
           if let Some(decoded_voice) = &data.decoded_voice {
-            let tx = match &speaker.message_send{
-              Some(r) => r,
-              None => {
-                speaker.message_send = Some(spawn_speaker_thread(self.inner.storage_tx.clone(), speaker.id.clone(), self.default_channel.get()).await);
-                if let Some(r) = &speaker.message_send{
-                  r
-                }else{
-                  println!("Error creating new tx for speaker with SSRC {ssrc:?}");
+            match &speaker.message_send{
+              Some(r) => {
+                let mut error = false;
+                if let Err(err) = r.lock().await.feed(
+                  TungsteniteMessage::Binary(resample_discord_to_bytes(decoded_voice.to_vec()))
+                ).await{
+                  println!("Error sending data to whisper thread: {}", err);
+                  error = true;
+                };
+                if let Err(err) = r.lock().await.flush().await{
+                  println!("Error sending data to whisper thread: {}", err);
+                  error = true;
+                }
+                if error{
+                  speaker.message_send = None;
                   continue;
                 }
               },
-            };
-            if let Err(err) = tx.send(decoded_voice.clone()){
-              if err.to_string() != "channel closed"{
-                println!("Err sending voice data over channel: {}", err);
-              }
-              let new_tx = spawn_speaker_thread(self.inner.storage_tx.clone(), speaker.id.clone(), self.default_channel.get()).await;
-              if let Err(err) = new_tx.send(decoded_voice.clone()){
-                println!("Error creating new channel for voice data: {}", err);
-                speaker.message_send = None;
-              }else{
-                speaker.message_send = Some(new_tx);
-              }
+              None => {
+                println!("Created new speaker thread");
+                let new_mutex = TokioMutex::new(
+                  spawn_whisper_thread(self.inner.storage_tx.clone(), speaker.id.clone(), self.default_channel.get()).await
+                );
+                if let Err(err) = new_mutex.lock().await.feed(
+                  TungsteniteMessage::Binary(resample_discord_to_bytes(decoded_voice.to_vec()))
+                ).await{
+                  println!("Error creating new whisper thread: {}", err);
+                  speaker.message_send = None;
+                  continue;
+                };
+                if let Err(err) = new_mutex.lock().await.flush().await{
+                  println!("Error creating new whisper thread: {}", err);
+                  speaker.message_send = None;
+                  continue;
+                }
+                speaker.message_send = Some(new_mutex);
+              },
             };
           }else{
             println!("Decode disabled");
@@ -204,7 +215,12 @@ impl VoiceEventHandler for Reciever{
 
         for ssrc in &tick.silent{
           if let Some(mut speaker) = self.inner.known_ssrcs.get_mut(ssrc){
-            speaker.message_send = None;
+            if let Some(message_send) = &speaker.message_send{
+              if let Err(err) = message_send.lock().await.close().await{
+                println!("Couldn't close whisper connection: {}", err);
+              }
+              speaker.message_send = None;
+            }
           }
         }
       },
@@ -343,28 +359,4 @@ fn resample_discord_to_bytes(sound_data: Vec<i16>) -> Vec<u8>{
   let byte_chunks: Vec<[u8; 2]> = resampled.iter().map(|x| {x.to_le_bytes()}).collect();
   let sound_bytes = byte_chunks.into_flattened();
   sound_bytes
-}
-
-async fn spawn_speaker_thread(kobold_tx: UnboundedSender<StorageMessage>, display_name: String, channel: u64) -> UnboundedSender<Vec<i16>>{
-  let(tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-  tokio::spawn(async move{
-    let local_tx = kobold_tx.clone();
-    let mut write = spawn_whisper_thread(local_tx.clone(), display_name.clone(), channel).await;
-    while let Some(data) = rx.recv().await{
-      let bytes = resample_discord_to_bytes(data);
-      if let Err(_) = write.feed(TungsteniteMessage::binary(bytes.clone())).await{
-        write = spawn_whisper_thread(local_tx.clone(), display_name.clone(), channel).await;
-        write.feed(TungsteniteMessage::Binary(bytes)).await.expect("Unable to recreate whisper thread");
-        write.flush().await.expect("Unable to recreate whisper thread");
-        continue;
-      }
-      if let Err(_) = write.flush().await{
-        write = spawn_whisper_thread(local_tx.clone(), display_name.clone(), channel).await;
-        write.feed(TungsteniteMessage::Binary(bytes)).await.expect("Unable to recreate whisper thread");
-        write.flush().await.expect("Unable to recreate whisper thread");
-        continue;
-      }
-    }
-  });
-  tx
 }

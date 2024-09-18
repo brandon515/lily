@@ -10,7 +10,7 @@ struct WhisperResponse{
   text: String,
 }
 
-type WhisperSink = futures_util::stream::SplitSink<
+pub type WhisperSink = futures_util::stream::SplitSink<
   tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<
       tokio::net::TcpStream>>, TungsteniteMessage>;
