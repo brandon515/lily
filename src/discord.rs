@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use poise::serenity_prelude as serenity;
 use ::serenity::{
   all::{
-    ChannelId as PoiseChannelId, Guild, Http, Mentionable, PartialGuild
+    ChannelId as PoiseChannelId, Guild, Http, Mentionable, PartialGuild, Typing
   }, 
   async_trait
 };
@@ -66,15 +66,14 @@ pub fn get_http() -> Http{
   Http::new(&token)
 }
 
-pub async fn start_broadcasting(channel_id: u64){
+pub async fn start_typing(channel_id: u64) -> Option<Typing>{
   let http = get_http();
   if let Ok(channel_op) = http.get_channel(channel_id.into()).await{
     if let Some(channel) = channel_op.guild(){
-      if let Err(err) = channel.broadcast_typing(&http).await{
-        println!("Unable to broadcast typing: {}", err);
-      }
+      return Some(channel.start_typing(&Arc::new(http)));
     }
   }
+  None
 }
 
 fn split_string(codepoints_over: usize, original_string: String) -> (String, String){
@@ -82,7 +81,7 @@ fn split_string(codepoints_over: usize, original_string: String) -> (String, Str
   original_string.char_indices().rev().nth(codepoints_over).map(|(i, _)| &original_string[i..]).unwrap().to_string())
 }
 
-pub async fn send_discord_message(message: String, channel_id: u64){
+pub async fn send_discord_message(message: String, channel_id: u64, typing_state: Typing){
   let http = get_http();
   if let Ok(channel_op) = http.get_channel(channel_id.into()).await{
     if let Some(channel) = channel_op.guild(){
@@ -97,6 +96,7 @@ pub async fn send_discord_message(message: String, channel_id: u64){
       }
     }
   }
+  typing_state.stop();
 }
 
 impl Reciever{

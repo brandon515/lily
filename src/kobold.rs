@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{
 use crate::{
   discord::{
     send_discord_message, 
-    start_broadcasting
+    start_typing,
   },
   storage::StorageMessage,
 };
@@ -191,7 +191,13 @@ pub fn spawn_kobold_thread(message_storage_channel: UnboundedSender<StorageMessa
     while let Some(kobold_req) = kobold_rx.recv().await{
       let origin_channel = kobold_req.origin_channel;
       let messages = kobold_req.messages;
-      start_broadcasting(origin_channel).await;
+      let typing_state = match start_typing(origin_channel).await{
+        Some(r) => r,
+        None => {
+          println!("Unable to start typing in the channel, perhaps the discord server has died.");
+          continue;
+        }
+      };
       let bot_name = std::env::var("BOT_NAME").unwrap();
       let new_prompt = format!(
         "{TEXT_START}{HEADER_START}system{HEADER_END}\n\n{AI_DESC}{TEXT_END}"
@@ -231,15 +237,15 @@ pub fn spawn_kobold_thread(message_storage_channel: UnboundedSender<StorageMessa
             Ok(r) => r,
             Err(err) => {
               println!("Unable to request from Kobold Server: {}", err);
-              send_discord_message("The KoboldCPP server is down".to_string(), origin_channel).await;
+              send_discord_message("The KoboldCPP server is down".to_string(), origin_channel, typing_state).await;
               continue;
             },
           };
       
       if res.status() == StatusCode::OK{
         let res_json: KoboldResponse = res.json().await.unwrap();
-        for x in res_json.results.iter(){
-          send_discord_message(x.text.clone(), origin_channel).await;
+        if let Some(x) = res_json.results.iter().next(){
+          send_discord_message(x.text.clone(), origin_channel, typing_state).await;
           if let Err(err) = message_storage_channel.send(StorageMessage{
             message: x.text.clone(),
             author: bot_name.to_string(),
